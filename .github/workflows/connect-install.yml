@@ -1,0 +1,165 @@
+# connect-install - ONE button that connects this worker copy to the client's
+# app. Run it from the Actions tab (Run workflow). It:
+#   1. bundles the client's logo and fonts for the offline image renderer
+#      (commits render/ if it changed),
+#   2. generates every shared secret inside this run (nobody ever sees them),
+#   3. stores the worker-side secrets in THIS repo,
+#   4. stores the matching app-side secrets in the client's Supabase project.
+# Re-running is safe: it regenerates both sides together. Run it again after
+# the yearly Claude sign-in renewal, with the new date.
+#
+# It needs three repository secrets that the installer adds first
+# (Settings > Secrets and variables > Actions):
+#   CLAUDE_CODE_OAUTH_TOKEN  - from `claude setup-token`, client's Claude Pro sign-in
+#   SETUP_GH_TOKEN           - fine-grained token on THIS repo only:
+#                              Contents RW, Secrets RW, Actions R. It is also the
+#                              app's wake-up token for this worker.
+#   SUPABASE_ACCESS_TOKEN    - the client's Supabase access token
+# No AI API key exists anywhere in this flow.
+name: connect-install
+on:
+  workflow_dispatch:
+    inputs:
+      supabase_project_ref:
+        description: "Client's Supabase project ref (20 lowercase letters)"
+        required: true
+      logo_url:
+        description: "Client's logo URL - the same URL entered in Visual Studio (https://...)"
+        required: true
+      display_font:
+        description: "Display font, Google Fonts name and weight, e.g. Playfair Display:700"
+        required: true
+      body_font:
+        description: "Body font, Google Fonts name and weights, e.g. Lato:400,500"
+        required: true
+      token_date:
+        description: "Date of the Claude sign-in (YYYY-MM-DD). Leave empty for today."
+        required: false
+      tenant_user_id:
+        description: "Only if the run asks for it: the User UID from Supabase > Authentication > Users"
+        required: false
+concurrency:
+  group: connect-install
+  cancel-in-progress: false
+permissions:
+  contents: read
+
+jobs:
+  connect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check the three setup secrets exist
+        env:
+          A: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          B: ${{ secrets.SETUP_GH_TOKEN }}
+          C: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          REF: ${{ inputs.supabase_project_ref }}
+        run: |
+          miss=""
+          [ -n "$A" ] || miss="$miss CLAUDE_CODE_OAUTH_TOKEN"
+          [ -n "$B" ] || miss="$miss SETUP_GH_TOKEN"
+          [ -n "$C" ] || miss="$miss SUPABASE_ACCESS_TOKEN"
+          [ -z "$miss" ] || { echo "::error::Add these repository secrets first:$miss"; exit 1; }
+          echo "$REF" | grep -Eq '^[a-z]{20}$' || { echo "::error::supabase_project_ref must be exactly 20 lowercase letters"; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.SETUP_GH_TOKEN }}
+
+      - name: Bundle the client's logo and fonts
+        env:
+          LOGO_URL: ${{ inputs.logo_url }}
+          F1: ${{ inputs.display_font }}
+          F2: ${{ inputs.body_font }}
+        run: |
+          python3 scripts/set-client-brand.py --logo-url "$LOGO_URL" --font "$F1" --font "$F2"
+          ( cd render/assets && sha256sum -c ../assets.sha256 )
+          if [ -n "$(git status --porcelain render)" ]; then
+            git config user.name "connect-install"
+            git config user.email "connect-install@users.noreply.github.com"
+            git add render
+            git commit -m "Client brand assets (connect-install)"
+            git push
+          else
+            echo "brand assets unchanged"
+          fi
+
+      - name: Generate the shared secrets (masked, never printed)
+        run: |
+          umask 077; D=$RUNNER_TEMP/s; mkdir -p "$D"
+          for n in DISPATCH_SECRET WORKER_SECRET DISPATCHER_SECRET CLAIM_SEAL_KEY; do
+            openssl rand -hex 32 | tr -d '\n' > "$D/$n"; echo "::add-mask::$(cat "$D/$n")"
+          done
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "$D/CLAIM_SEAL_PRIVATE_KEY" 2>/dev/null
+          openssl pkey -in "$D/CLAIM_SEAL_PRIVATE_KEY" -pubout -out "$D/CLAIM_SEAL_PUBLIC_KEY"
+          echo "secrets generated: DISPATCH_SECRET WORKER_SECRET DISPATCHER_SECRET CLAIM_SEAL_KEY CLAIM_SEAL_PRIVATE_KEY CLAIM_SEAL_PUBLIC_KEY"
+
+      - name: Find the client's one login (TENANT_USER_ID)
+        id: tenant
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          REF: ${{ inputs.supabase_project_ref }}
+          OVERRIDE: ${{ inputs.tenant_user_id }}
+        run: |
+          if [ -n "$OVERRIDE" ]; then
+            echo "$OVERRIDE" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' || { echo "::error::tenant_user_id is not a User UID"; exit 1; }
+            echo "id=$OVERRIDE" >> "$GITHUB_OUTPUT"; echo "login id given by installer"; exit 0
+          fi
+          RESP=$(curl -sS -X POST "https://api.supabase.com/v1/projects/$REF/database/query" \
+            -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" -H "Content-Type: application/json" \
+            -d '{"query":"select id from auth.users order by created_at"}')
+          python3 - "$RESP" <<'PY'
+          import json, os, sys
+          def stop(msg):
+              print(f"::error::{msg}"); sys.exit(1)
+          try:
+              rows = json.loads(sys.argv[1])
+          except Exception:
+              stop("Supabase did not answer. Check SUPABASE_ACCESS_TOKEN and the project ref.")
+          if not isinstance(rows, list):
+              stop("Supabase refused the login lookup. Re-run and fill tenant_user_id with the User UID from Supabase > Authentication > Users.")
+          if len(rows) != 1:
+              stop(f"Expected exactly one login user, found {len(rows)}. Finish the wizard step that creates the one login first.")
+          open(os.environ["GITHUB_OUTPUT"], "a").write(f"id={rows[0]['id']}\n")
+          print("one login found")
+          PY
+
+      - name: Store the worker-side secrets in this repo
+        env:
+          GH_TOKEN: ${{ secrets.SETUP_GH_TOKEN }}
+          REF: ${{ inputs.supabase_project_ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          D=$RUNNER_TEMP/s
+          printf 'https://%s.supabase.co/functions/v1' "$REF" > "$D/SUPABASE_FN_BASE"
+          for n in DISPATCH_SECRET WORKER_SECRET SUPABASE_FN_BASE CLAIM_SEAL_KEY CLAIM_SEAL_PUBLIC_KEY CLAIM_SEAL_PRIVATE_KEY; do
+            gh secret set "$n" --repo "$REPO" < "$D/$n"
+          done
+          echo "worker secrets stored"
+
+      - name: Store the app-side secrets in the client's Supabase
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SETUP_GH_TOKEN: ${{ secrets.SETUP_GH_TOKEN }}
+          REF: ${{ inputs.supabase_project_ref }}
+          REPO: ${{ github.repository }}
+          TENANT: ${{ steps.tenant.outputs.id }}
+          TOKEN_DATE: ${{ inputs.token_date }}
+        run: |
+          D=$RUNNER_TEMP/s
+          START="${TOKEN_DATE:-$(date -u +%F)}"
+          date -d "$START" >/dev/null 2>&1 || { echo "::error::token_date must be YYYY-MM-DD"; exit 1; }
+          EXPIRES=$(date -u -d "$START + 1 year" +%F)
+          npx -y supabase@latest secrets set --project-ref "$REF" \
+            DISPATCHER_SECRET="$(cat "$D/DISPATCHER_SECRET")" \
+            DISPATCH_SECRET="$(cat "$D/DISPATCH_SECRET")" \
+            WORKER_SECRET="$(cat "$D/WORKER_SECRET")" \
+            DISPATCH_GITHUB_TOKEN="$SETUP_GH_TOKEN" \
+            WORKER_REPO="$REPO" \
+            WORKER_TOKEN_EXPIRES_AT="$EXPIRES" \
+            TENANT_USER_ID="$TENANT" \
+            VISUALS_ENABLED=true >/dev/null
+          echo "app secrets stored. Claude sign-in renewal due before: $EXPIRES"
+          echo "### Connected. Claude sign-in renewal due before **$EXPIRES**" >> "$GITHUB_STEP_SUMMARY"
+          rm -rf "$D"

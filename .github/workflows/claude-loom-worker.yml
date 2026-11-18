@@ -1,0 +1,677 @@
+# LOCAL DRAFT v7 - ENFORCED CHILD-NAMESPACE BOUNDARY for the model process.
+# NOT COMMITTED ANYWHERE. Builds on v6 (3-job credential split, immutable
+# artifacts, trusted ALWAYS recovery DAG, public-key egress) and replaces the
+# v6 "credential poverty only" model-job containment with an enforced
+# namespace boundary via the pinned action's SUPPORTED input
+# path_to_claude_code_executable (base-action/action.yml:147,
+# run-claude.ts spawn path - verified in the pinned source
+# d70510b174a1244958df0b03166a54912811f3e6). No fork, no vendor, no
+# capture patch.
+#
+# What v7 changes against v6 (reviewer directives 7:36/7:37):
+#  1. The action spawns claude-sandbox-wrapper.sh (trusted host-side, from
+#     THIS repo at checkout) instead of the raw CLI. The wrapper re-execs the
+#     real CLI inside a docker child namespace: explicit env allowlist
+#     (CLAUDE_CODE_OAUTH_TOKEN ONLY), --cap-drop ALL, no-new-privileges,
+#     non-root uid 1000, --read-only root, scratch tmpfs HOME and /tmp,
+#     ro /src (repo+snapshot), rw ONLY /work (dedicated out dir, host tmp),
+#     fresh pids, NO docker socket, default bridge net (egress only).
+#     The model process therefore has NO GITHUB_* file-command paths, NO
+#     ACTIONS_* runtime/cache/results/OIDC vars, NO GITHUB_TOKEN/GH_TOKEN at
+#     all - structurally, not by YAML env seeding.
+#  2. github_token: ${{ github.token }} is passed to the action
+#     (action.yml:88 -> OVERRIDE_GITHUB_TOKEN, src/github/token.ts:160,
+#     src/entrypoints/prepare.ts:43). Without this the action UNCONDITIONALLY
+#     does its OIDC setup and mints a GitHub App token with CONTENTS_WRITE
+#     into the step env. With it, the host-side token is the default
+#     read-only GITHUB_TOKEN (job permissions contents: read), and the
+#     wrapper strips it from the child anyway. id-token: write is REMOVED
+#     from the workflow - nothing needs OIDC anymore.
+#     NOTE: this hardens the NEW path. No production-leak claim is made:
+#     the old deployed workflow is unchanged and this draft touches nothing
+#     remotely.
+#  3. Prompt uses absolute paths: cwd inside the namespace is /src (RO), the
+#     model writes ONLY /work/output.json. The complete-job transcript audit
+#     accepts realpath == "/work/output.json" as a FIXED TRUSTED CONSTANT
+#     (not derived from GITHUB_WORKSPACE) and rejects every other write.
+#  4. Image is built BEFORE the model step and the claim window is
+#     RE-CHECKED after the build (cold build/pull cost can eat the window).
+#     The claim TTL is NEVER extended.
+#  5. Trusted capture: trusted-out-move.sh accepts ONLY the canonical plain
+#     /work/output.json from the dedicated out dir (fail-closed on symlinks,
+#     hardlinks, traversal, extra entries, >4MiB), then sealing is the v6
+#     public-key hybrid, unchanged.
+#  6. Open item (deferred, NOT assumed): /tmp noexec compatibility with the
+#     real bun-compiled CLI (it may exec from tmp). Fake-CLI proofs cannot
+#     establish this; proven only in the real-binary proof before any
+#     credential run.
+#
+# Containment comment for the model job is updated: v6's "poisoned
+# file-command channel finds no credentials" is now backed by an enforced
+# boundary - the model process never sees the file-command paths at all.
+name: claude-loom-worker
+run-name: "loom-worker ${{ github.event.client_payload.job_id || 'no-payload' }}"   # observability: run title shows the claimed job_id (fixes elimination-only run<->job mapping)
+on:
+  repository_dispatch:
+    types: [claude-job]
+concurrency:
+  group: claude-loom-worker
+  cancel-in-progress: false
+  queue: max   # bounded global serialization WITHOUT pending drops: one run at a
+  # time (subscription-safe), up to 100 pending (docs.github.com concurrency
+  # "queue" property). Default single-pending cancels the waiting run - observed
+  # 2026-10-30: runs 41059633095/41059635423 cancelled while pending, jobs stranded.
+  # CAVEAT (reviewer 9:06): >100 pending is NOT structurally impossible; overflow
+  # cancels CONSUME job attempts (max 2) / daily retry and can park jobs without
+  # guaranteed healing. queue:max removes drops up to 100, not beyond.
+permissions:
+  contents: read   # nothing needs id-token: write; github_token input covers the action's git needs
+
+jobs:
+  verify-claim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      job_id: ${{ steps.verify.outputs.job_id }}
+      mode: ${{ steps.mode.outputs.mode }}
+      claim_expires_at: ${{ steps.claim.outputs.claim_expires_at }}   # non-secret deadline (W4)
+    steps:
+      - name: Verify dispatch signature
+        id: verify
+        env:
+          DISPATCH_SECRET: ${{ secrets.DISPATCH_SECRET }}
+        run: |
+          python3 - <<'PY'
+          import json, hmac, hashlib, os, sys, time
+          p = json.load(open(os.environ["GITHUB_EVENT_PATH"]))["client_payload"]
+          print(f"::add-mask::{p['claim_token']}")
+          sig = p.pop("sig", "")
+          raw = "|".join([p["job_id"], p["request_id"], p["claim_token"], str(p["ts"])])
+          expect = hmac.new(os.environ["DISPATCH_SECRET"].encode(), raw.encode(), hashlib.sha256).hexdigest()
+          if not hmac.compare_digest(sig, expect): sys.exit("bad signature")
+          if abs(time.time() - float(p["ts"])) > 600: sys.exit("stale dispatch")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"job_id={p['job_id']}\nclaim_token={p['claim_token']}\n")
+          PY
+      - name: Claim job
+        id: claim
+        env:
+          SUPABASE_FN_BASE: ${{ secrets.SUPABASE_FN_BASE }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+          JOB_ID: ${{ steps.verify.outputs.job_id }}
+          CLAIM_TOKEN: ${{ steps.verify.outputs.claim_token }}
+        run: |
+          RESP=$(curl -sf -X POST "$SUPABASE_FN_BASE/claude-job-claim" \
+            -H "x-worker-secret: $WORKER_SECRET" -H "Content-Type: application/json" \
+            -d "{\"job_id\":\"$JOB_ID\",\"claim_token\":\"$CLAIM_TOKEN\"}")
+          echo "$RESP" | python3 -c 'import json,sys; d=json.load(sys.stdin); open("input_snapshot.json","w").write(json.dumps(d["input_snapshot"]))'
+          TOKEN=$(echo "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["completion_token"])')
+          echo "::add-mask::$TOKEN"
+          echo "$TOKEN" > /tmp/completion_token
+          EXPIRES=$(echo "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["claim_expires_at"])')
+          echo "claim_expires_at=$EXPIRES" >> "$GITHUB_OUTPUT"
+          sha256sum input_snapshot.json | awk '{print $1"  input_snapshot.json"}' > snapshot.sha256
+      - name: Snapshot digest
+        id: sha
+        run: echo "sha=$(cut -d' ' -f1 snapshot.sha256)" >> "$GITHUB_OUTPUT"
+      - name: Select run mode (fixed allowlist, fails closed)
+        id: mode
+        run: |
+          # >>> EXTRACT-BLOCK: select-mode >>>
+          python3 - <<'PY'
+          import json, os, sys
+          mode = "default"
+          try:
+              snap = json.load(open("input_snapshot.json"))
+              if isinstance(snap, dict) and snap.get("kind") == "interactive":
+                  ik = snap.get("interactiveKind")
+                  if ik == "discover-sources":
+                      mode = "discover"
+                  elif ik == "draft-visual":
+                      mode = "visual"
+          except Exception:
+              pass
+          if mode == "visual":
+              try:
+                  ctx = snap.get("context") or {}
+                  c = ctx.get("canvas") or {}
+                  w, h = c.get("w"), c.get("h")
+                  assert isinstance(w, int) and isinstance(h, int) and 100 <= w <= 4096 and 100 <= h <= 4096
+                  assert ctx.get("visual_id") and ctx.get("source_hash")
+              except Exception:
+                  sys.exit("draft-visual job without bound canvas/visual_id/source_hash in claim context")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("mode=" + mode + "\n")
+          PY
+          # <<< EXTRACT-BLOCK: select-mode <<<
+      - name: Seal claim context (AES-256-GCM, random IV, AAD-bound)
+        id: seal
+        env:
+          CLAIM_SEAL_KEY: ${{ secrets.CLAIM_SEAL_KEY }}
+          CLAIM_TOKEN: ${{ steps.verify.outputs.claim_token }}
+          JOB_ID: ${{ steps.verify.outputs.job_id }}
+          SNAP_SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          # Unchanged from v6. CLAIM_SEAL_KEY is a NEW repo secret whose
+          # generation/storage needs its own account-mutation clearance; this
+          # draft never creates it and never logs the value.
+          node - <<'JS'
+          const crypto = require("crypto"), fs = require("fs");
+          const key = crypto.pbkdf2Sync(process.env.CLAIM_SEAL_KEY, "kl-claim-seal-v1", 100000, 32, "sha256");
+          const ctx = JSON.stringify({ job_id: process.env.JOB_ID, claim_token: process.env.CLAIM_TOKEN,
+            completion_token: fs.readFileSync("/tmp/completion_token", "utf8").trim() });
+          const iv = crypto.randomBytes(12);
+          const aad = `${process.env.JOB_ID}|${process.env.GITHUB_RUN_ID}|${process.env.SNAP_SHA}`;
+          const c = crypto.createCipheriv("aes-256-gcm", key, iv); c.setAAD(Buffer.from(aad));
+          const ct = Buffer.concat([c.update(ctx, "utf8"), c.final()]);
+          fs.writeFileSync("claim-sealed.bin", Buffer.concat([iv, c.getAuthTag(), ct]));
+          JS
+      - name: Hand off trusted claim context (immutable artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: trusted-claim
+          path: |
+            input_snapshot.json
+            snapshot.sha256
+            claim-sealed.bin
+          retention-days: 1
+          if-no-files-found: error
+
+  model:
+    needs: verify-claim
+    runs-on: ubuntu-latest
+    timeout-minutes: 8   # cold image build + model run, within the claim TTL (re-checked post-build)
+    permissions:
+      contents: read   # GITHUB_TOKEN here is the default READ-ONLY token; no id-token
+    # CREDENTIAL CONTAINMENT (v7, enforced): the model process runs inside a
+    # docker child namespace spawned by the trusted wrapper. It sees ONLY
+    # CLAUDE_CODE_OAUTH_TOKEN in its env - no GITHUB_* file-command paths, no
+    # ACTIONS_* runtime/OIDC vars, no GITHUB_TOKEN/GH_TOKEN, no WORKER_SECRET,
+    # no seal key material. The host step env additionally carries the
+    # read-only default GITHUB_TOKEN via OVERRIDE_GITHUB_TOKEN (github_token
+    # input) so the action never mints a contents:write app token.
+    steps:
+      - uses: actions/checkout@v4   # worker-prompt.md + wrapper + Dockerfile ride in this repo
+        with:
+          persist-credentials: false   # B4: no token in .git/config
+      - name: Fetch trusted claim context
+        uses: actions/download-artifact@v4
+        with:
+          name: trusted-claim
+      - name: Verify trusted snapshot digest
+        run: sha256sum -c snapshot.sha256
+      - name: Build the sandbox runner image (BEFORE the model; cold cost lands here)
+        id: image
+        run: |
+          chmod +x claude-sandbox-wrapper.sh trusted-out-move.sh
+          docker build -f Dockerfile.claude-runner -t kl-claude-runner:2.1.312 .
+          docker image inspect kl-claude-runner:2.1.312 --format '{{.Id}}'
+      - name: Render sandbox prerequisites (trusted, BEFORE the model; visual jobs only)
+        if: needs.verify-claim.outputs.mode == 'visual'
+        run: |
+          # render/render.sh refuses to run without bubblewrap (rc47, no
+          # weaker fallback). Install it if the runner image lacks it, and
+          # allow unprivileged user namespaces if the image's AppArmor policy
+          # blocks them. Runs before the model step and before the claim-
+          # window check, so its cost is counted against the window.
+          command -v bwrap >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q bubblewrap; }
+          if ! bwrap --unshare-all --ro-bind / / true 2>/dev/null; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-all --ro-bind / / true
+          test -x /opt/google/chrome/chrome
+          echo "render sandbox ready: $(bwrap --version)"
+      - name: Claim-window check (W4 - AFTER the build, NEVER extending the TTL)
+        id: window
+        env:
+          CLAIM_EXPIRES_AT: ${{ needs.verify-claim.outputs.claim_expires_at }}
+        run: |
+          python3 - <<'EOF'
+          import os, sys, datetime
+          exp = datetime.datetime.fromisoformat(os.environ["CLAIM_EXPIRES_AT"].replace("Z", "+00:00"))
+          remaining = (exp - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+          need = 8 * 60 + 120
+          print(f"claim window remaining after build: {remaining:.0f}s, required: {need}s")
+          sys.exit(0 if remaining >= need else 1)
+          EOF
+      - name: Prepare dedicated out dir (host tmp, never the workspace)
+        id: outdir
+        run: |
+          # mktemp -d is 0700 owner runner(uid 1001); the container writes as
+          # uid 1000 -> EACCES without this (reviewer-proven blocker). Open
+          # ONLY this dedicated empty dir to the container uid; nothing broader.
+          D=$(mktemp -d /tmp/claude-out.XXXXXX)
+          chmod 0777 "$D"
+          echo "dir=$D" >> "$GITHUB_OUTPUT"
+      - name: Generate draft (sandboxed CLI via supported wrapper input)
+        id: draft
+        if: needs.verify-claim.outputs.mode == 'default'   # F2: explicit per-mode gate - a visual job must NEVER enter this step
+        continue-on-error: true   # failure must still reach seal (transcript) and complete (recovery)
+        uses: anthropics/claude-code-action@d70510b174a1244958df0b03166a54912811f3e6
+        env:
+          SANDBOX_BACKEND: docker
+          MODEL_SRC_DIR: ${{ github.workspace }}
+          MODEL_WORKDIR: ${{ steps.outdir.outputs.dir }}
+          CLAUDE_BIN: /usr/local/bin/claude
+          CLAUDE_RUNNER_IMAGE: kl-claude-runner:2.1.312
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}   # OVERRIDE_GITHUB_TOKEN: read-only default token, no app-token minting
+          allowed_bots: "github-actions[bot]"   # dispatch actor is the built-in bot when sent by the signing helper; one exact name, never "*"
+          path_to_claude_code_executable: ${{ github.workspace }}/claude-sandbox-wrapper.sh
+          claude_args: --allowedTools "Read" "Write" --disallowedTools "Bash"
+          prompt: |
+            Read /src/worker-prompt.md and /src/input_snapshot.json (the
+            repository and snapshot are mounted read-only at /src; your
+            working directory is /src). Follow worker-prompt.md exactly and
+            write the draft output JSON to the ABSOLUTE path
+            /work/output.json - the only writable location. Do not print
+            tokens, secrets, or full prompt contents to the log.
+      - name: Discover sources (sandboxed; public web search only)
+        id: discover
+        if: needs.verify-claim.outputs.mode == 'discover'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@d70510b174a1244958df0b03166a54912811f3e6
+        env:
+          SANDBOX_BACKEND: docker
+          MODEL_SRC_DIR: ${{ github.workspace }}
+          MODEL_WORKDIR: ${{ steps.outdir.outputs.dir }}
+          CLAUDE_BIN: /usr/local/bin/claude
+          CLAUDE_RUNNER_IMAGE: kl-claude-runner:2.1.312
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          allowed_bots: "github-actions[bot]"
+          path_to_claude_code_executable: ${{ github.workspace }}/claude-sandbox-wrapper.sh
+          claude_args: --allowedTools "Read" "Write" "WebSearch" --disallowedTools "Bash"
+          prompt: |
+            Read /src/worker-prompt.md and /src/input_snapshot.json (mounted
+            read-only at /src; your working directory is /src). This is a
+            discover-sources job: follow the "Discover-sources jobs" section
+            of worker-prompt.md exactly and write output.json to the ABSOLUTE
+            path /work/output.json - the only writable location. Do not
+            print tokens, secrets, or full prompt contents to the log.
+      - name: Generate visual (sandboxed; html under the exact contract)
+        id: visual
+        if: needs.verify-claim.outputs.mode == 'visual'
+        continue-on-error: true   # failure must still reach seal (transcript) and complete (recovery)
+        uses: anthropics/claude-code-action@d70510b174a1244958df0b03166a54912811f3e6
+        env:
+          SANDBOX_BACKEND: docker
+          MODEL_SRC_DIR: ${{ github.workspace }}
+          MODEL_WORKDIR: ${{ steps.outdir.outputs.dir }}
+          CLAUDE_BIN: /usr/local/bin/claude
+          CLAUDE_RUNNER_IMAGE: kl-claude-runner:2.1.312
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}   # OVERRIDE_GITHUB_TOKEN: read-only default token, no app-token minting
+          allowed_bots: "github-actions[bot]"   # dispatch actor is the built-in bot when sent by the signing helper; one exact name, never "*"
+          path_to_claude_code_executable: ${{ github.workspace }}/claude-sandbox-wrapper.sh
+          claude_args: --allowedTools "Read" "Write" --disallowedTools "Bash"
+          prompt: |
+            Read /src/worker-prompt.md and /src/input_snapshot.json (the
+            repository and snapshot are mounted read-only at /src; your
+            working directory is /src). This is a draft-visual job: follow
+            the "Draft-visual jobs" section of worker-prompt.md exactly and
+            write the output JSON to the ABSOLUTE path /work/output.json -
+            the only writable location. Do not print tokens, secrets, or
+            full prompt contents to the log.
+      - name: Mode DAG assertion (exactly one model step executed, matching mode)
+        if: always() && steps.window.outcome == 'success'
+        env:
+          MODE: ${{ needs.verify-claim.outputs.mode }}
+          DRAFT_O: ${{ steps.draft.outcome }}
+          DISCOVER_O: ${{ steps.discover.outcome }}
+          VISUAL_O: ${{ steps.visual.outcome }}
+        run: |
+          # >>> EXTRACT-BLOCK: mode-dag >>>
+          python3 - <<'PY'
+          import os, sys
+          outs = {"draft": os.environ["DRAFT_O"], "discover": os.environ["DISCOVER_O"], "visual": os.environ["VISUAL_O"]}
+          ran = sorted(k for k, v in outs.items() if v != "skipped")
+          mode = os.environ["MODE"]
+          expect = {"default": "draft", "discover": "discover", "visual": "visual"}.get(mode)
+          if expect is None:
+              sys.exit(f"unknown mode {mode!r}: refusing to continue")
+          if ran != [expect]:
+              sys.exit(f"mode DAG violated: mode={mode} but steps that ran={ran} (expected exactly [{expect}])")
+          print(f"mode DAG ok: {mode} -> {expect}")
+          PY
+          # <<< EXTRACT-BLOCK: mode-dag <<<
+      - name: Trusted capture of the canonical output (fail-closed)
+        id: capture
+        if: always() && steps.window.outcome == 'success'
+        continue-on-error: true   # a refused/missing output is model failure evidence; seal + complete handle it
+        env:
+          OUT_DIR: ${{ steps.outdir.outputs.dir }}
+        run: |
+          # Accepts ONLY a plain regular output.json in the dedicated out
+          # dir: rejects symlinks, hardlinks, extra entries, traversal,
+          # >4MiB. Nothing else the model wrote can cross.
+          ./trusted-out-move.sh "$OUT_DIR" output.json
+      - name: Render visual PNG (UNTRUSTED ZONE, F4)
+        id: render
+        if: always() && steps.window.outcome == 'success' && needs.verify-claim.outputs.mode == 'visual' && steps.capture.outcome == 'success'
+        continue-on-error: true   # render failure is model failure evidence; seal carries model_ok=false
+        run: |
+          # This step runs in the MODEL job = untrusted zone. The bwrap
+          # renderer contains model HTML; the PNG it emits is NOT trusted:
+          # the complete job re-checks PNG signature+IHDR dims against the
+          # sealed claim canvas, and the SERVER does the full PNG decode +
+          # canvas validation at completion (F4). Canvas comes only from
+          # the digest-verified claim snapshot, never model bytes. The
+          # download step (name: trusted-claim, no path) extracts at the
+          # workspace ROOT - input_snapshot.json lives here, not in a subdir.
+          python3 scripts/select-mode.py
+          bash scripts/render-visual.sh output.json mode.json "$RUNNER_TEMP/visual.png" "$RUNNER_TEMP/visual.png.b64"
+      - name: Seal model artifacts (PUBLIC-KEY hybrid - no private material here)
+        if: always() && steps.window.outcome == 'success'
+        env:
+          CLAIM_SEAL_PUBLIC_KEY: ${{ secrets.CLAIM_SEAL_PUBLIC_KEY }}
+          JOB_ID: ${{ needs.verify-claim.outputs.job_id }}
+          MODE: ${{ needs.verify-claim.outputs.mode }}
+          DRAFT_OUTCOME: ${{ steps.draft.outcome }}
+          DISCOVER_OUTCOME: ${{ steps.discover.outcome }}
+          VISUAL_OUTCOME: ${{ steps.visual.outcome }}
+          RENDER_OUTCOME: ${{ steps.render.outcome }}
+          CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
+        run: |
+          # Unchanged from v6: credentialless egress, RSA-OAEP(4096)+AES-GCM,
+          # AAD job|run|snapshot digest, model_ok carried in the bundle.
+          node - <<'JS'
+          const crypto = require("crypto"), fs = require("fs");
+          const rd = p => fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null;
+          const out = rd("output.json");
+          const tr = rd(`${process.env.RUNNER_TEMP}/claude-execution-output.json`);
+          const sha = rd("snapshot.sha256");
+          const snapSha = sha ? sha.split(/\s+/)[0] : "none";
+          const dek = crypto.randomBytes(32);
+          const wrapped = crypto.publicEncrypt(
+            { key: process.env.CLAIM_SEAL_PUBLIC_KEY, oaepHash: "sha256", padding: crypto.constants.RSA_PKCS1_OAEP_PADDING }, dek);
+          const iv = crypto.randomBytes(12);
+          const aad = `${process.env.JOB_ID}|${process.env.GITHUB_RUN_ID}|${snapSha}`;
+          const c = crypto.createCipheriv("aes-256-gcm", dek, iv); c.setAAD(Buffer.from(aad));
+          const MODE = process.env.MODE;
+          const modelOk = MODE === "visual"
+            ? (process.env.VISUAL_OUTCOME === "success" && process.env.RENDER_OUTCOME === "success")
+            : MODE === "discover" ? process.env.DISCOVER_OUTCOME === "success"
+            : process.env.DRAFT_OUTCOME === "success";
+          // Which stage failed, from step outcomes only (never from model text).
+          // The complete job uses it so a post-model failure (capture/render) is
+          // reported as that stage, not guessed from transcript keywords.
+          const stepOutcome = MODE === "visual" ? process.env.VISUAL_OUTCOME
+            : MODE === "discover" ? process.env.DISCOVER_OUTCOME : process.env.DRAFT_OUTCOME;
+          const failStage = stepOutcome !== "success" ? "model"
+            : process.env.CAPTURE_OUTCOME !== "success" ? "capture"
+            : (MODE === "visual" && process.env.RENDER_OUTCOME !== "success") ? "render" : null;
+          const pngB64 = MODE === "visual" ? rd(`${process.env.RUNNER_TEMP}/visual.png.b64`) : null;
+          const ct = Buffer.concat([c.update(JSON.stringify({ output: out, transcript: tr, model_ok: modelOk, fail_stage: failStage, png_b64: pngB64 }), "utf8"), c.final()]);
+          const wl = Buffer.alloc(2); wl.writeUInt16BE(wrapped.length);
+          fs.writeFileSync("model-sealed.bin", Buffer.concat([wl, wrapped, iv, c.getAuthTag(), ct]));
+          JS
+      - name: Hand off sealed model artifacts (single fixed file, data only)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: model-sealed.bin
+          retention-days: 1
+          if-no-files-found: warn   # absence is a valid failure signal; the trusted recovery posts fail honestly
+
+  complete:
+    needs: [verify-claim, model]
+    if: always() && needs.verify-claim.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch artifacts
+        if: always()
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*"
+          path: artifacts
+      - name: Unseal trusted claim context (symmetric key, trusted job only)
+        if: always()
+        env:
+          CLAIM_SEAL_KEY: ${{ secrets.CLAIM_SEAL_KEY }}
+          JOB_ID: ${{ needs.verify-claim.outputs.job_id }}
+        run: |
+          set -e
+          [ "$(ls artifacts/trusted-claim | sort | tr '\n' ' ')" = "claim-sealed.bin input_snapshot.json snapshot.sha256 " ] || { echo "trusted-claim file set mismatch"; exit 1; }
+          node - <<'JS'
+          const crypto = require("crypto"), fs = require("fs");
+          const key = crypto.pbkdf2Sync(process.env.CLAIM_SEAL_KEY, "kl-claim-seal-v1", 100000, 32, "sha256");
+          const aad = `${process.env.JOB_ID}|${process.env.GITHUB_RUN_ID}|${fs.readFileSync("artifacts/trusted-claim/snapshot.sha256","utf8").split(/\s+/)[0]}`;
+          const b = fs.readFileSync("artifacts/trusted-claim/claim-sealed.bin");
+          const d = crypto.createDecipheriv("aes-256-gcm", key, b.subarray(0,12));
+          d.setAAD(Buffer.from(aad)); d.setAuthTag(b.subarray(12,28));
+          fs.writeFileSync("/tmp/claim-ctx.json", Buffer.concat([d.update(b.subarray(28)), d.final()]).toString("utf8"));
+          JS
+      - name: Complete or recover (ALWAYS posts exactly one outcome)
+        if: always()
+        env:
+          SUPABASE_FN_BASE: ${{ secrets.SUPABASE_FN_BASE }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}   # scan-only
+          CLAIM_SEAL_PRIVATE_KEY: ${{ secrets.CLAIM_SEAL_PRIVATE_KEY }}
+          CLAIM_EXPIRES_AT: ${{ needs.verify-claim.outputs.claim_expires_at }}
+          JOB_ID: ${{ needs.verify-claim.outputs.job_id }}
+          MODE: ${{ needs.verify-claim.outputs.mode }}
+          MODEL_RESULT: ${{ needs.model.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, datetime, subprocess
+          ctx = json.load(open("/tmp/claim-ctx.json"))
+          if ctx["job_id"] != os.environ["JOB_ID"]: sys.exit("sealed job_id mismatch")
+          COMPLETION_TOKEN, CLAIM_TOKEN = ctx["completion_token"], ctx["claim_token"]
+          secrets_to_scan = [os.environ["WORKER_SECRET"], os.environ["CLAUDE_CODE_OAUTH_TOKEN"],
+                             COMPLETION_TOKEN, CLAIM_TOKEN]
+          def scan(blob):
+              return any(s and len(s) >= 8 and s in blob for s in secrets_to_scan)
+          payload = {"job_id": os.environ["JOB_ID"], "completion_token": COMPLETION_TOKEN}
+          def fail(reason_code, error):
+              return "claude-job-fail", {**payload, "reason_code": reason_code, "error": error}
+          endpoint, out_payload = None, None
+
+          exp = datetime.datetime.fromisoformat(os.environ["CLAIM_EXPIRES_AT"].replace("Z", "+00:00"))
+          expired = datetime.datetime.now(datetime.timezone.utc) >= exp
+
+          mdir = "artifacts/model-artifacts"
+          files = sorted(os.listdir(mdir)) if os.path.isdir(mdir) else []
+          unsealed = None
+          unseal_err = None
+          if files == ["model-sealed.bin"]:
+              unseal = subprocess.run(["node", "-e", '''
+                  const crypto = require("crypto"), fs = require("fs");
+                  const b = fs.readFileSync("artifacts/model-artifacts/model-sealed.bin");
+                  const wl = b.readUInt16BE(0);
+                  const dek = crypto.privateDecrypt(
+                    { key: process.env.CLAIM_SEAL_PRIVATE_KEY, oaepHash: "sha256", padding: crypto.constants.RSA_PKCS1_OAEP_PADDING },
+                    b.subarray(2, 2 + wl));
+                  const aad = `${process.env.JOB_ID}|${process.env.GITHUB_RUN_ID}|${fs.readFileSync("artifacts/trusted-claim/snapshot.sha256","utf8").split(/\s+/)[0]}`;
+                  const off = 2 + wl;
+                  const d = crypto.createDecipheriv("aes-256-gcm", dek, b.subarray(off, off + 12));
+                  d.setAAD(Buffer.from(aad)); d.setAuthTag(b.subarray(off + 12, off + 28));
+                  process.stdout.write(Buffer.concat([d.update(b.subarray(off + 28)), d.final()]).toString("utf8"));
+              '''], capture_output=True, text=True, env={**os.environ})
+              if unseal.returncode == 0:
+                  try: unsealed = json.loads(unseal.stdout)
+                  except Exception as e: unseal_err = f"sealed bundle unparsable: {type(e).__name__}"
+              else:
+                  unseal_err = "GCM auth or unwrap failed (tampered/corrupted artifact)"
+
+          model_failed = os.environ["MODEL_RESULT"] != "success" or (unsealed is not None and unsealed.get("model_ok") is False)
+          ok = not model_failed and not expired
+          msgs, transcript_raw = None, ""
+          if unsealed and unsealed.get("transcript"):
+              transcript_raw = unsealed["transcript"]
+              try:
+                  m = json.loads(transcript_raw)
+                  msgs = m if isinstance(m, list) else None
+              except Exception:
+                  msgs = None
+
+          tail, classification = "", "error"
+          fail_stage = unsealed.get("fail_stage") if unsealed else None
+          # Keyword classification (quota/auth) applies ONLY when the model step
+          # itself failed. A capture/render failure after a successful model step
+          # is an application failure and must never be labeled auth or quota.
+          if transcript_raw and fail_stage in (None, "model") and not scan(transcript_raw):
+              low = transcript_raw.lower()
+              if any(k in low for k in ("credit", "quota", "usage limit")): classification = "quota"
+              elif any(k in low for k in ("401", "unauthorized", "oauth", "authentication")): classification = "auth"
+              tail = transcript_raw[-500:]
+              if scan(tail): tail = ""
+
+          # v7 audit: the ONLY acceptable write target is the FIXED TRUSTED
+          # CONSTANT /work/output.json (the model's in-namespace absolute
+          # path). Not derived from GITHUB_WORKSPACE, nothing else accepted.
+          ALLOWED = "/work/output.json"
+          WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit")
+          def audit():
+              if msgs is None: return "no transcript to audit"
+              for m in msgs:
+                  if not isinstance(m, dict): continue
+                  content = (m.get("message") or {}).get("content")
+                  for x in content if isinstance(content, list) else []:
+                      if not isinstance(x, dict) or x.get("type") != "tool_use": continue
+                      name = x.get("name")
+                      if name in WRITE_TOOLS:
+                          inp = x.get("input") if isinstance(x.get("input"), dict) else {}
+                          tgt = inp.get("file_path") or inp.get("notebook_path")
+                          if not isinstance(tgt, str) or not tgt:
+                              return f"write tool {name} without a path"
+                          if tgt.startswith("/"):
+                              abs_t = tgt
+                          else:
+                              # relative writes resolve against the in-namespace cwd /src
+                              abs_t = os.path.normpath(os.path.join("/src", tgt))
+                          if os.path.normpath(abs_t) != ALLOWED:
+                              return f"write outside /work/output.json: {tgt[:120]}"
+                      elif name == "Bash":
+                          return "unexpected Bash tool_use in transcript"
+              return None
+
+          if expired:
+              endpoint, out_payload = fail("error", "claim window expired before completion (W4)")
+          elif model_failed and not unsealed:
+              endpoint, out_payload = fail("error",
+                  f"model job ended '{os.environ['MODEL_RESULT']}' with no sealed artifacts (pre-seal failure, e.g. claim window)")
+          elif unseal_err:
+              endpoint, out_payload = fail("error", f"model artifact unseal failed: {unseal_err}")
+          elif model_failed and fail_stage == "render":
+              endpoint, out_payload = fail("error",
+                  "visual render rejected: the sandboxed renderer refused the generated HTML before producing a PNG (exit-code stage failure; not an auth or quota failure)")
+          elif model_failed and fail_stage == "capture":
+              endpoint, out_payload = fail("error",
+                  "model output capture refused: output.json missing or not a plain regular file (not an auth or quota failure)")
+          elif model_failed:
+              endpoint, out_payload = fail(classification,
+                  tail or f"model step failed (job result {os.environ['MODEL_RESULT']}; step outcome not success)")
+          elif msgs is None:
+              endpoint, out_payload = fail("error", "successful model job without a parseable transcript (W2 fail-closed)")
+          elif audit():
+              endpoint, out_payload = fail("error", f"transcript write-audit failed: {audit()}")
+          else:
+              try:
+                  output = json.loads(unsealed.get("output") or "")
+              except Exception as e:
+                  endpoint, out_payload = fail("error", f"output.json unusable after successful model job: {type(e).__name__}")
+              else:
+                  if os.environ["MODE"] == "visual":
+                      # >>> EXTRACT-BLOCK: complete-visual >>>
+                      png_b64 = unsealed.get("png_b64")
+                      vsnap = json.load(open("artifacts/trusted-claim/input_snapshot.json"))
+                      vctx = vsnap.get("context") or {}
+                      vcanvas = vctx.get("canvas") or {}
+                      # Contract (G1, worker-prompt.md): output.json is
+                      # {"text": "<minified JSON>"} whose text parses to
+                      # exactly {visual_type, html} - the same shape the
+                      # render driver unwraps. One contract, all stages.
+                      inner = None
+                      if isinstance(output, dict) and set(output.keys()) == {"text"} and isinstance(output.get("text"), str):
+                          try:
+                              inner = json.loads(output["text"])
+                          except Exception:
+                              inner = None
+                      if not isinstance(png_b64, str) or len(png_b64) < 100:
+                          endpoint, out_payload = fail("error", "visual mode without a rendered PNG in the sealed bundle")
+                      elif not isinstance(inner, dict) or set(inner.keys()) != {"visual_type", "html"}:
+                          endpoint, out_payload = fail("error", "visual output contract violation: output.json must be {text: JSON{visual_type, html}}")
+                      elif scan(json.dumps(inner)) or scan(png_b64):
+                          endpoint, out_payload = fail("error", "visual payload failed credential hygiene scan")
+                      else:
+                          import base64 as _b64, struct as _struct
+                          try:
+                              raw = _b64.b64decode(png_b64, validate=True)
+                              if raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
+                                  raise ValueError("not a PNG")
+                              pw, ph = _struct.unpack(">II", raw[16:24])
+                              if pw != vcanvas.get("w") or ph != vcanvas.get("h"):
+                                  raise ValueError(f"dims {pw}x{ph} != claim canvas {vcanvas.get('w')}x{vcanvas.get('h')}")
+                          except Exception as e:
+                              endpoint, out_payload = fail("error", f"PNG header/IHDR validation failed: {e}")
+                          else:
+                              endpoint = "claude-job-complete"
+                              out_payload = {**payload, "output": inner, "pngBase64": png_b64,
+                                             "visual_id": vctx.get("visual_id"), "source_hash": vctx.get("source_hash"),
+                                             "canvas": vcanvas, "run_url": os.environ["RUN_URL"]}
+                      # <<< EXTRACT-BLOCK: complete-visual <<<
+                  elif isinstance(output, dict):
+                      output.pop("verified_urls", None)
+                      if os.environ["MODE"] == "discover":
+                          ids, urls = set(), set()
+                          for m in msgs:
+                              if not isinstance(m, dict): continue
+                              c = (m.get("message") or {}).get("content")
+                              blocks = [x for x in c if isinstance(x, dict)] if isinstance(c, list) else []
+                              for x in blocks:
+                                  if x.get("type") == "tool_use" and x.get("name") == "WebSearch": ids.add(x.get("id"))
+                              if m.get("type") != "user": continue
+                              trs = [x for x in blocks if x.get("type") == "tool_result"]
+                              if len(trs) != 1 or trs[0].get("is_error") or trs[0].get("tool_use_id") not in ids: continue
+                              tur = m.get("tool_use_result")
+                              for r in (tur.get("results") if isinstance(tur, dict) and isinstance(tur.get("results"), list) else []):
+                                  if isinstance(r, dict) and r.get("tool_use_id") == trs[0].get("tool_use_id") and isinstance(r.get("content"), list):
+                                      for h in r["content"]:
+                                          if isinstance(h, dict) and isinstance(h.get("url"), str): urls.add(h["url"])
+                          output["verified_urls"] = sorted(urls)[:500]
+                  # The visual branch above is total (every path assigns its
+                  # own endpoint/out_payload); the generic tail is for
+                  # default/discover ONLY - never overwrite the visual result.
+                  if os.environ["MODE"] != "visual":
+                      blob = json.dumps(output)
+                      if scan(blob):
+                          endpoint, out_payload = fail("error", "output failed credential hygiene scan")
+                      else:
+                          endpoint = "claude-job-complete"
+                          out_payload = {**payload, "output": output, "run_url": os.environ["RUN_URL"]}
+          json.dump(out_payload, open("/tmp/payload.json", "w"))
+          open("/tmp/endpoint", "w").write(endpoint)
+          print(f"outcome: {endpoint}" + (f" reason={out_payload.get('reason_code')}" if endpoint == "claude-job-fail" else ""))
+          PY
+      - name: POST the outcome (ALWAYS exactly once)
+        if: always()
+        env:
+          SUPABASE_FN_BASE: ${{ secrets.SUPABASE_FN_BASE }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+        run: |
+          test -s /tmp/payload.json && test -s /tmp/endpoint   # trusted-side invariant
+          CODE=$(curl -s -o /tmp/resp.json -w "%{http_code}" -X POST "$SUPABASE_FN_BASE/$(cat /tmp/endpoint)"             -H "x-worker-secret: $WORKER_SECRET" -H "Content-Type: application/json"             -d @/tmp/payload.json)
+          # job-logic.completeJob applies a novelty requeue and THEN returns 422
+          # {success:false, requeued:true, reason} (deployed job-logic.ts:192-193).
+          # That is a recorded, expected outcome - not a failed run (observed
+          # 2026-10-30 run 41059643113: requeue written 13:02:01.109, run still
+          # failed exit 22 on curl -f). Only requeued:true quiets it; the 422
+          # {error} dead-letter path (job-logic.ts:198) must keep failing.
+          if [ "$CODE" = "422" ] && [ "$(cat /tmp/endpoint)" = "claude-job-complete" ] &&             python3 -c 'import json,sys; sys.exit(0 if json.load(open("/tmp/resp.json")).get("requeued") is True else 1)'; then
+            echo "::notice::novelty requeue recorded by server (422 requeued=true) - expected outcome, job stays queued"
+            exit 0
+          fi
+          if [ "$CODE" -lt 200 ] || [ "$CODE" -ge 300 ]; then
+            echo "::error::$(cat /tmp/endpoint) POST returned HTTP $CODE: $(head -c 500 /tmp/resp.json)"
+            exit 1
+          fi

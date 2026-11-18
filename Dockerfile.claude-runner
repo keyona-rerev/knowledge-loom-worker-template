@@ -1,0 +1,24 @@
+# kl-claude-runner - pinned provenance for the sandboxed model process.
+# Base: node 22 bookworm-slim, multi-arch index digest pinned (resolved live
+# from the Docker Hub registry API, 2026-10-29, read-only public source):
+#   index sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da
+#   linux/amd64 child sha256:9f0dde62d10e7ff7a310ecaebd66225f6b46c17e6cb778449a77b05d3541bea2
+# node MAJOR bumped 20 -> 22: @anthropic-ai/claude-code 2.1.312 declares
+# engines node >=22.0.0 (npm registry metadata, verified 2026-10-29).
+# Re-resolve and re-pin before any LATER provisioning; digest pins rot when
+# tags move.
+# CLI version MUST equal the pinned action's CLAUDE_CODE_VERSION (2.1.312):
+# same binary line, same OAuth env auth. Build fails closed on any mismatch.
+FROM node:22-bookworm-slim@sha256:4b150b48b4116e2a22f2c39cc27025fbf4f153e2078fd3b14d159fdb5c7279da
+ARG CLAUDE_CODE_VERSION=2.1.312
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} \
+ && V="$(claude --version)" \
+ && case "$V" in "${CLAUDE_CODE_VERSION}"*) : ;; *) echo "CLI version mismatch: $V" >&2; exit 1 ;; esac
+# The node base images already ship the `node` user at uid/gid 1000 - reuse
+# it. A groupadd -g 1000 collides with it and exits 4 (the actual failure in
+# QA runs #1 and #2; npm's EBADENGINE on node 20 was a warning, not the
+# fatal). HOME=/home/claude is a tmpfs mounted by the wrapper, so no home
+# directory is needed in the image.
+USER 1000:1000
+WORKDIR /src
+# No ENTRYPOINT: the trusted wrapper supplies the absolute CLI path and args.
