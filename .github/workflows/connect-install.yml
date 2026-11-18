@@ -151,7 +151,7 @@ jobs:
           START="${TOKEN_DATE:-$(date -u +%F)}"
           date -d "$START" >/dev/null 2>&1 || { echo "::error::token_date must be YYYY-MM-DD"; exit 1; }
           EXPIRES=$(date -u -d "$START + 1 year" +%F)
-          npx -y supabase@latest secrets set --project-ref "$REF" \
+          npx -y supabase@latest secrets set --yes --project-ref "$REF" \
             DISPATCHER_SECRET="$(cat "$D/DISPATCHER_SECRET")" \
             DISPATCH_SECRET="$(cat "$D/DISPATCH_SECRET")" \
             WORKER_SECRET="$(cat "$D/WORKER_SECRET")" \
