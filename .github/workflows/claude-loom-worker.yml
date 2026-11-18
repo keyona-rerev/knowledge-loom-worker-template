@@ -623,22 +623,42 @@ jobs:
                   elif isinstance(output, dict):
                       output.pop("verified_urls", None)
                       if os.environ["MODE"] == "discover":
+                          # Robust provenance extraction: the previous logic
+                          # required exactly one tool_result per user message and
+                          # a specific tool_use_result.results nesting, so
+                          # parallel WebSearch calls or a transcript shape change
+                          # silently yielded verified_urls=[] and the server
+                          # failed closed. Collect URLs from ANY nesting shape.
+                          # Provenance is preserved: URLs are collected ONLY
+                          # from system-generated tool_result messages whose
+                          # tool_use_id belongs to a WebSearch tool_use - never
+                          # from model-authored text.
                           ids, urls = set(), set()
                           for m in msgs:
                               if not isinstance(m, dict): continue
-                              c = (m.get("message") or {}).get("content")
+                              mm = m.get("message")
+                              c = (mm if isinstance(mm, dict) else {}).get("content")
                               blocks = [x for x in c if isinstance(x, dict)] if isinstance(c, list) else []
                               for x in blocks:
                                   if x.get("type") == "tool_use" and x.get("name") == "WebSearch": ids.add(x.get("id"))
-                              if m.get("type") != "user": continue
-                              trs = [x for x in blocks if x.get("type") == "tool_result"]
-                              if len(trs) != 1 or trs[0].get("is_error") or trs[0].get("tool_use_id") not in ids: continue
-                              tur = m.get("tool_use_result")
-                              for r in (tur.get("results") if isinstance(tur, dict) and isinstance(tur.get("results"), list) else []):
-                                  if isinstance(r, dict) and r.get("tool_use_id") == trs[0].get("tool_use_id") and isinstance(r.get("content"), list):
-                                      for h in r["content"]:
-                                          if isinstance(h, dict) and isinstance(h.get("url"), str): urls.add(h["url"])
+                          def _walk_urls(o):
+                              if isinstance(o, dict):
+                                  u = o.get("url")
+                                  if isinstance(u, str) and u.startswith(("http://", "https://")): urls.add(u)
+                                  for v in o.values(): _walk_urls(v)
+                              elif isinstance(o, list):
+                                  for v in o: _walk_urls(v)
+                          for m in msgs:
+                              if not isinstance(m, dict) or m.get("type") != "user": continue
+                              mm = m.get("message")
+                              c = (mm if isinstance(mm, dict) else {}).get("content")
+                              blocks = [x for x in c if isinstance(x, dict)] if isinstance(c, list) else []
+                              hits = [x for x in blocks if x.get("type") == "tool_result" and not x.get("is_error") and x.get("tool_use_id") in ids]
+                              if not hits: continue
+                              for tr in hits: _walk_urls(tr)
+                              _walk_urls(m.get("tool_use_result"))
                           output["verified_urls"] = sorted(urls)[:500]
+                          print(f"discover provenance: {len(urls)} verified url(s) from WebSearch tool results")
                   # The visual branch above is total (every path assigns its
                   # own endpoint/out_payload); the generic tail is for
                   # default/discover ONLY - never overwrite the visual result.
