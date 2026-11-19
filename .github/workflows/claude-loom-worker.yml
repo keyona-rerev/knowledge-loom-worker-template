@@ -221,8 +221,16 @@ jobs:
         if: needs.verify-claim.outputs.mode == 'visual' || needs.verify-claim.outputs.mode == 'welcome'
         run: |
           # Welcome jobs also stitch the rendered slides into MP4/GIF with ffmpeg.
-          if [ "${{ needs.verify-claim.outputs.mode }}" = "welcome" ] && ! command -v ffmpeg >/dev/null; then
-            sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+          # A pinned, hash-verified static build from PyPI (imageio-ffmpeg 0.6.0,
+          # Jan 2025) installs in seconds; apt mirrors were observed taking
+          # 7m35s and blowing the 8-minute model budget (run 44623470549).
+          if [ "${{ needs.verify-claim.outputs.mode }}" = "welcome" ]; then
+            echo "imageio-ffmpeg==0.6.0 --hash=sha256:c7e46fcec401dd990405049d2e2f475e2b397779df2519b544b8aab515195282" > "$RUNNER_TEMP/ffmpeg-req.txt"
+            timeout 120 python3 -m pip install -q --no-deps --only-binary=:all: --require-hashes \
+              --target "$RUNNER_TEMP/ffmpeg-pkg" -r "$RUNNER_TEMP/ffmpeg-req.txt"
+            FF=$(ls "$RUNNER_TEMP"/ffmpeg-pkg/imageio_ffmpeg/binaries/ffmpeg-linux* | head -1)
+            chmod +x "$FF" && "$FF" -hide_banner -version | head -1
+            echo "FFMPEG_BIN=$FF" >> "$GITHUB_ENV"
           fi
           # render/render.sh refuses to run without bubblewrap (rc47, no
           # weaker fallback). Install it if the runner image lacks it, and

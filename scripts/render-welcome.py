@@ -23,6 +23,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RENDER = os.path.join(HERE, "..", "render", "render.sh")
 LOGO_URL_FILE = os.path.join(HERE, "..", "render", "assets", "logo-url.txt")
 
+FFMPEG = os.environ.get("FFMPEG_BIN") or "ffmpeg"  # pinned binary set by the workflow
 SLIDE_SECONDS = 4.0
 FADE = 0.4
 MAX_MP4 = 8 * 1024 * 1024
@@ -173,7 +174,7 @@ def main():
         pngs.append(pp)
 
     # MP4: each slide held SLIDE_SECONDS with a short fade in/out, concatenated.
-    args = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    args = [FFMPEG, "-hide_banner", "-loglevel", "error", "-y"]
     for p in pngs:
         args += ["-loop", "1", "-t", str(SLIDE_SECONDS), "-framerate", "30", "-i", p]
     parts = "".join(
@@ -193,7 +194,7 @@ def main():
             f.write(f"file '{p}'\nduration 2.5\n")
         f.write(f"file '{pngs[-1]}'\n")
     gif = os.path.join(out_dir, "welcome.gif")
-    if run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+    if run([FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst,
             "-vf", "scale=640:-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse",
             "-loop", "0", gif]) != 0:
         die(72, "ffmpeg gif encode failed")
