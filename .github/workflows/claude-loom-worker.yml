@@ -129,6 +129,8 @@ jobs:
                       mode = "discover"
                   elif ik == "draft-visual":
                       mode = "visual"
+                  elif ik == "welcome-video":
+                      mode = "welcome"
           except Exception:
               pass
           if mode == "visual":
@@ -140,6 +142,15 @@ jobs:
                   assert ctx.get("visual_id") and ctx.get("source_hash")
               except Exception:
                   sys.exit("draft-visual job without bound canvas/visual_id/source_hash in claim context")
+          if mode == "welcome":
+              try:
+                  ctx = snap.get("context") or {}
+                  c = ctx.get("canvas") or {}
+                  w, h = c.get("w"), c.get("h")
+                  assert isinstance(w, int) and isinstance(h, int) and 320 <= w <= 1920 and 180 <= h <= 1080
+                  assert isinstance(ctx.get("brand"), dict)
+              except Exception:
+                  sys.exit("welcome-video job without bound canvas/brand in claim context")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("mode=" + mode + "\n")
           PY
@@ -206,9 +217,13 @@ jobs:
           chmod +x claude-sandbox-wrapper.sh trusted-out-move.sh
           docker build -f Dockerfile.claude-runner -t kl-claude-runner:2.1.312 .
           docker image inspect kl-claude-runner:2.1.312 --format '{{.Id}}'
-      - name: Render sandbox prerequisites (trusted, BEFORE the model; visual jobs only)
-        if: needs.verify-claim.outputs.mode == 'visual'
+      - name: Render sandbox prerequisites (trusted, BEFORE the model; visual and welcome jobs only)
+        if: needs.verify-claim.outputs.mode == 'visual' || needs.verify-claim.outputs.mode == 'welcome'
         run: |
+          # Welcome jobs also stitch the rendered slides into MP4/GIF with ffmpeg.
+          if [ "${{ needs.verify-claim.outputs.mode }}" = "welcome" ] && ! command -v ffmpeg >/dev/null; then
+            sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+          fi
           # render/render.sh refuses to run without bubblewrap (rc47, no
           # weaker fallback). Install it if the runner image lacks it, and
           # allow unprivileged user namespaces if the image's AppArmor policy
@@ -316,6 +331,31 @@ jobs:
             write the output JSON to the ABSOLUTE path /work/output.json -
             the only writable location. Do not print tokens, secrets, or
             full prompt contents to the log.
+      - name: Generate welcome script (sandboxed; words only, no HTML)
+        id: welcome
+        if: needs.verify-claim.outputs.mode == 'welcome'
+        continue-on-error: true   # failure must still reach seal (transcript) and complete (recovery)
+        uses: anthropics/claude-code-action@d70510b174a1244958df0b03166a54912811f3e6
+        env:
+          SANDBOX_BACKEND: docker
+          MODEL_SRC_DIR: ${{ github.workspace }}
+          MODEL_WORKDIR: ${{ steps.outdir.outputs.dir }}
+          CLAUDE_BIN: /usr/local/bin/claude
+          CLAUDE_RUNNER_IMAGE: kl-claude-runner:2.1.312
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}   # OVERRIDE_GITHUB_TOKEN: read-only default token, no app-token minting
+          allowed_bots: "github-actions[bot]"
+          path_to_claude_code_executable: ${{ github.workspace }}/claude-sandbox-wrapper.sh
+          claude_args: --allowedTools "Read" "Write" --disallowedTools "Bash"
+          prompt: |
+            Read /src/worker-prompt.md and /src/input_snapshot.json (the
+            repository and snapshot are mounted read-only at /src; your
+            working directory is /src). This is a welcome-video job: follow
+            the "Welcome-video jobs" section of worker-prompt.md exactly and
+            write the output JSON to the ABSOLUTE path /work/output.json -
+            the only writable location. Do not print tokens, secrets, or
+            full prompt contents to the log.
       - name: Mode DAG assertion (exactly one model step executed, matching mode)
         if: always() && steps.window.outcome == 'success'
         env:
@@ -323,14 +363,16 @@ jobs:
           DRAFT_O: ${{ steps.draft.outcome }}
           DISCOVER_O: ${{ steps.discover.outcome }}
           VISUAL_O: ${{ steps.visual.outcome }}
+          WELCOME_O: ${{ steps.welcome.outcome }}
         run: |
           # >>> EXTRACT-BLOCK: mode-dag >>>
           python3 - <<'PY'
           import os, sys
-          outs = {"draft": os.environ["DRAFT_O"], "discover": os.environ["DISCOVER_O"], "visual": os.environ["VISUAL_O"]}
+          outs = {"draft": os.environ["DRAFT_O"], "discover": os.environ["DISCOVER_O"], "visual": os.environ["VISUAL_O"],
+                  "welcome": os.environ["WELCOME_O"]}
           ran = sorted(k for k, v in outs.items() if v != "skipped")
           mode = os.environ["MODE"]
-          expect = {"default": "draft", "discover": "discover", "visual": "visual"}.get(mode)
+          expect = {"default": "draft", "discover": "discover", "visual": "visual", "welcome": "welcome"}.get(mode)
           if expect is None:
               sys.exit(f"unknown mode {mode!r}: refusing to continue")
           if ran != [expect]:
@@ -364,6 +406,17 @@ jobs:
           # workspace ROOT - input_snapshot.json lives here, not in a subdir.
           python3 scripts/select-mode.py
           bash scripts/render-visual.sh output.json mode.json "$RUNNER_TEMP/visual.png" "$RUNNER_TEMP/visual.png.b64"
+      - name: Render welcome video (UNTRUSTED ZONE; trusted slide template, model words only)
+        id: render_welcome
+        if: always() && steps.window.outcome == 'success' && needs.verify-claim.outputs.mode == 'welcome' && steps.capture.outcome == 'success'
+        continue-on-error: true   # render failure is model failure evidence; seal carries model_ok=false
+        run: |
+          # The model wrote WORDS only. scripts/render-welcome.py validates the
+          # word contract, escapes it into a fixed slide template (brand from the
+          # digest-verified claim snapshot), renders each slide with the reviewed
+          # bwrap renderer, and stitches MP4/GIF with ffmpeg. The complete job and
+          # the server re-check media signatures and size bounds.
+          python3 scripts/render-welcome.py output.json input_snapshot.json "$RUNNER_TEMP/welcome"
       - name: Seal model artifacts (PUBLIC-KEY hybrid - no private material here)
         if: always() && steps.window.outcome == 'success'
         env:
@@ -374,6 +427,8 @@ jobs:
           DISCOVER_OUTCOME: ${{ steps.discover.outcome }}
           VISUAL_OUTCOME: ${{ steps.visual.outcome }}
           RENDER_OUTCOME: ${{ steps.render.outcome }}
+          WELCOME_OUTCOME: ${{ steps.welcome.outcome }}
+          RENDER_WELCOME_OUTCOME: ${{ steps.render_welcome.outcome }}
           CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
         run: |
           # Unchanged from v6: credentialless egress, RSA-OAEP(4096)+AES-GCM,
@@ -394,18 +449,24 @@ jobs:
           const MODE = process.env.MODE;
           const modelOk = MODE === "visual"
             ? (process.env.VISUAL_OUTCOME === "success" && process.env.RENDER_OUTCOME === "success")
+            : MODE === "welcome"
+            ? (process.env.WELCOME_OUTCOME === "success" && process.env.RENDER_WELCOME_OUTCOME === "success")
             : MODE === "discover" ? process.env.DISCOVER_OUTCOME === "success"
             : process.env.DRAFT_OUTCOME === "success";
           // Which stage failed, from step outcomes only (never from model text).
           // The complete job uses it so a post-model failure (capture/render) is
           // reported as that stage, not guessed from transcript keywords.
           const stepOutcome = MODE === "visual" ? process.env.VISUAL_OUTCOME
+            : MODE === "welcome" ? process.env.WELCOME_OUTCOME
             : MODE === "discover" ? process.env.DISCOVER_OUTCOME : process.env.DRAFT_OUTCOME;
           const failStage = stepOutcome !== "success" ? "model"
             : process.env.CAPTURE_OUTCOME !== "success" ? "capture"
-            : (MODE === "visual" && process.env.RENDER_OUTCOME !== "success") ? "render" : null;
+            : (MODE === "visual" && process.env.RENDER_OUTCOME !== "success") ? "render"
+            : (MODE === "welcome" && process.env.RENDER_WELCOME_OUTCOME !== "success") ? "render" : null;
           const pngB64 = MODE === "visual" ? rd(`${process.env.RUNNER_TEMP}/visual.png.b64`) : null;
-          const ct = Buffer.concat([c.update(JSON.stringify({ output: out, transcript: tr, model_ok: modelOk, fail_stage: failStage, png_b64: pngB64 }), "utf8"), c.final()]);
+          const mp4B64 = MODE === "welcome" ? rd(`${process.env.RUNNER_TEMP}/welcome/welcome.mp4.b64`) : null;
+          const gifB64 = MODE === "welcome" ? rd(`${process.env.RUNNER_TEMP}/welcome/welcome.gif.b64`) : null;
+          const ct = Buffer.concat([c.update(JSON.stringify({ output: out, transcript: tr, model_ok: modelOk, fail_stage: failStage, png_b64: pngB64, mp4_b64: mp4B64, gif_b64: gifB64 }), "utf8"), c.final()]);
           const wl = Buffer.alloc(2); wl.writeUInt16BE(wrapped.length);
           fs.writeFileSync("model-sealed.bin", Buffer.concat([wl, wrapped, iv, c.getAuthTag(), ct]));
           JS
@@ -562,6 +623,9 @@ jobs:
                   f"model job ended '{os.environ['MODEL_RESULT']}' with no sealed artifacts (pre-seal failure, e.g. claim window)")
           elif unseal_err:
               endpoint, out_payload = fail("error", f"model artifact unseal failed: {unseal_err}")
+          elif model_failed and fail_stage == "render" and os.environ["MODE"] == "welcome":
+              endpoint, out_payload = fail("error",
+                  "welcome render rejected: the word contract failed validation or the slide render/ffmpeg encode failed (exit-code stage failure; not an auth or quota failure)")
           elif model_failed and fail_stage == "render":
               endpoint, out_payload = fail("error",
                   "visual render rejected: the sandboxed renderer refused the generated HTML before producing a PNG (exit-code stage failure; not an auth or quota failure)")
@@ -620,6 +684,42 @@ jobs:
                                              "visual_id": vctx.get("visual_id"), "source_hash": vctx.get("source_hash"),
                                              "canvas": vcanvas, "run_url": os.environ["RUN_URL"]}
                       # <<< EXTRACT-BLOCK: complete-visual <<<
+                  elif os.environ["MODE"] == "welcome":
+                      # >>> EXTRACT-BLOCK: complete-welcome >>>
+                      # Contract (worker-prompt.md "Welcome-video jobs"): output.json
+                      # is {"text": "<minified JSON>"} whose text parses to exactly
+                      # {subject, preheader, intro, expect, slides}. render-welcome.py
+                      # already enforced lengths; re-check shape + media here.
+                      import base64 as _b64
+                      mp4_b64, gif_b64 = unsealed.get("mp4_b64"), unsealed.get("gif_b64")
+                      inner = None
+                      if isinstance(output, dict) and set(output.keys()) == {"text"} and isinstance(output.get("text"), str):
+                          try:
+                              inner = json.loads(output["text"])
+                          except Exception:
+                              inner = None
+                      WKEYS = {"subject", "preheader", "intro", "expect", "slides"}
+                      if not isinstance(mp4_b64, str) or len(mp4_b64) < 1000 or not isinstance(gif_b64, str) or len(gif_b64) < 100:
+                          endpoint, out_payload = fail("error", "welcome mode without rendered MP4/GIF in the sealed bundle")
+                      elif not isinstance(inner, dict) or set(inner.keys()) != WKEYS:
+                          endpoint, out_payload = fail("error", "welcome output contract violation: output.json must be {text: JSON{subject, preheader, intro, expect, slides}}")
+                      elif scan(json.dumps(inner)) or scan(mp4_b64) or scan(gif_b64):
+                          endpoint, out_payload = fail("error", "welcome payload failed credential hygiene scan")
+                      else:
+                          try:
+                              mraw = _b64.b64decode(mp4_b64, validate=True)
+                              graw = _b64.b64decode(gif_b64, validate=True)
+                              if mraw[4:8] != b"ftyp" or len(mraw) > 8 * 1024 * 1024:
+                                  raise ValueError("mp4 signature/size")
+                              if graw[:6] not in (b"GIF89a", b"GIF87a") or len(graw) > 3 * 1024 * 1024:
+                                  raise ValueError("gif signature/size")
+                          except Exception as e:
+                              endpoint, out_payload = fail("error", f"welcome media validation failed: {e}")
+                          else:
+                              endpoint = "claude-job-complete"
+                              out_payload = {**payload, "output": inner, "mp4Base64": mp4_b64, "gifBase64": gif_b64,
+                                             "run_url": os.environ["RUN_URL"]}
+                      # <<< EXTRACT-BLOCK: complete-welcome <<<
                   elif isinstance(output, dict):
                       output.pop("verified_urls", None)
                       if os.environ["MODE"] == "discover":
@@ -661,8 +761,8 @@ jobs:
                           print(f"discover provenance: {len(urls)} verified url(s) from WebSearch tool results")
                   # The visual branch above is total (every path assigns its
                   # own endpoint/out_payload); the generic tail is for
-                  # default/discover ONLY - never overwrite the visual result.
-                  if os.environ["MODE"] != "visual":
+                  # default/discover ONLY - never overwrite the visual/welcome result.
+                  if os.environ["MODE"] not in ("visual", "welcome"):
                       blob = json.dumps(output)
                       if scan(blob):
                           endpoint, out_payload = fail("error", "output failed credential hygiene scan")
