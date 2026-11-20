@@ -15,6 +15,27 @@ css = open(os.path.join(d, 'assets/fonts-inline.css')).read()
 logo = open(os.path.join(d, 'assets/logo.b64.txt')).read()
 h = open(p).read()
 
+# Preview mode (PREVIEW_COMPACT=1, set only by the visual-preview step): the
+# preview HTML is stored in the job result, which the server caps at about
+# 1 MB. The full bundled font CSS is ~1.5 MB (every weight x every script
+# subset), so a self-contained preview always exceeded it (HTTP 422
+# "interactive result exceeds size bound"). Keep only @font-face blocks for
+# families the page names, and only Latin subsets (or blocks with no
+# unicode-range). The PNG render does not set this and keeps every font.
+if os.environ.get('PREVIEW_COMPACT') == '1':
+    _blocks = re.findall(r'@font-face\s*\{[^}]*\}', css)
+    _low = h.lower()
+    def _fam(b):
+        m = re.search(r'font-family:\s*[\'"]?([^;\'"]+)', b)
+        return m.group(1).strip() if m else ''
+    _used = {f for f in {_fam(b) for b in _blocks} if f and f.lower() in _low}
+    def _latin(b):
+        m = re.search(r'unicode-range:\s*([^;]+)', b)
+        return (not m) or ('U+0000-00FF' in m.group(1).upper())
+    _keep = [b for b in _blocks if (not _used or _fam(b) in _used) and _latin(b)]
+    if _keep:
+        css = '\n'.join(_keep)
+
 CSP = ('<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
        'img-src data:; style-src \'unsafe-inline\'; font-src data:; script-src \'none\'; '
        'connect-src \'none\'; form-action \'none\'">')
