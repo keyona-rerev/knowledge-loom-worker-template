@@ -525,7 +525,7 @@ jobs:
           const failStage = stepOutcome !== "success" ? "model"
             : process.env.CAPTURE_OUTCOME !== "success" ? "capture"
             : (MODE === "visual" && process.env.RENDER_OUTCOME !== "success") ? "render"
-            : (MODE === "welcome" && process.env.RENDER_WELCOME_OUTCOME !== "success") ? "render" : null;
+            : (MODE === "welcome" && process.env.RENDER_WELCOME_OUTCOME !== "success") ? "render"
             : (MODE === "default" && process.env.PREVIEW_REWRITE_OUTCOME === "failure") ? "preview-rewrite" : null;
           const pngB64 = MODE === "visual" ? rd(`${process.env.RUNNER_TEMP}/visual.png.b64`) : null;
           const mp4B64 = MODE === "welcome" ? rd(`${process.env.RUNNER_TEMP}/welcome/welcome.mp4.b64`) : null;
