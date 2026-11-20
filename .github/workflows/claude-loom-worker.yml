@@ -211,6 +211,44 @@ jobs:
           name: trusted-claim
       - name: Verify trusted snapshot digest
         run: sha256sum -c snapshot.sha256
+      - name: Sync the client logo from the claim context (trusted, BEFORE the model)
+        # The renderer is offline and swaps exactly ONE recorded logo URL for
+        # the bundled logo. When the owner changed the logo in Visual Studio,
+        # the recorded URL went stale and every image was rejected ("residual
+        # external reference"). The server now puts the current logo URL in
+        # the digest-verified claim context (context.logo_url). If it differs
+        # from render/assets/logo-url.txt, bundle it here with the reviewed
+        # scripts/set-client-brand.py (https only, 2 MiB cap, PNG/JPEG/WebP/SVG
+        # check, assets.sha256 regenerated). This runs before any model step,
+        # so the model never touches the assets. A failed download keeps the
+        # bundled logo; the render then reports the mismatch as before.
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess, sys
+          snap = json.load(open("input_snapshot.json"))
+          ctx = snap.get("context") or {}
+          url = str(ctx.get("logo_url") or "").strip()
+          if not url:
+              # Older app servers do not send context.logo_url. The server-built
+              # visual system prompt (trusted, digest-verified) carries the same
+              # Visual Studio logo URL on its "- Logo: <url> —" line.
+              import re
+              m = re.search(r"- Logo: (https://\S+?)\s+\u2014", str(snap.get("system") or ""))
+              url = m.group(1) if m else ""
+          recorded = open("render/assets/logo-url.txt").read().strip() if os.path.exists("render/assets/logo-url.txt") else ""
+          if not url:
+              print("no logo_url in claim context; keeping the bundled logo")
+              sys.exit(0)
+          if not url.startswith("https://"):
+              print("logo_url is not https; keeping the bundled logo")
+              sys.exit(0)
+          if url == recorded:
+              print("bundled logo already matches the claim context")
+              sys.exit(0)
+          print("logo changed in Visual Studio; bundling the current logo")
+          subprocess.run([sys.executable, "scripts/set-client-brand.py", "--logo-url", url], check=True, timeout=90)
+          PY
       - name: Build the sandbox runner image (BEFORE the model; cold cost lands here)
         id: image
         run: |
