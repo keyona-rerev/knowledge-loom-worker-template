@@ -23,6 +23,17 @@ if isinstance(snap, dict) and snap.get("kind") == "interactive":
         if not ctx.get("visual_id") or not ctx.get("source_hash"):
             sys.exit("visual job without bound visual_id/source_hash in claim context")
         canvas = {"w": w, "h": h}
+    elif ik == "welcome-video":
+        mode = "welcome"
+        ctx = snap.get("context") or {}
+        c = ctx.get("canvas") or {}
+        w, h = c.get("w"), c.get("h")
+        # Fail closed: the slide canvas and brand come only from the claim context.
+        if not (isinstance(w, int) and isinstance(h, int) and 320 <= w <= 1920 and 180 <= h <= 1080):
+            sys.exit("welcome job without a valid claim-context canvas")
+        if not isinstance(ctx.get("brand"), dict):
+            sys.exit("welcome job without a brand block in claim context")
+        canvas = {"w": w, "h": h}
 with open("mode.json", "w") as f:
     json.dump({"mode": mode, "canvas": canvas}, f)
 with open(os.environ["GITHUB_OUTPUT"], "a") as f:

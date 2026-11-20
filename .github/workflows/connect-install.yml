@@ -163,3 +163,26 @@ jobs:
           echo "app secrets stored. Claude sign-in renewal due before: $EXPIRES"
           echo "### Connected. Claude sign-in renewal due before **$EXPIRES**" >> "$GITHUB_STEP_SUMMARY"
           rm -rf "$D"
+
+      - name: Queue the one-time welcome email and video (non-fatal)
+        continue-on-error: true   # the install is connected either way; the app's Settings can re-send
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          REF: ${{ inputs.supabase_project_ref }}
+        run: |
+          # New function secrets need a moment to reach the edge runtime.
+          sleep 25
+          # The database itself calls welcome-start with the cron secret it
+          # already holds (pg_net), so no secret value ever passes through this
+          # run or its log. welcome-start is idempotent: it sends at most once
+          # unless the owner asks for a re-send from Settings.
+          SQL="select net.http_post(url := (select value from public.automation_config where key='project_url') || '/functions/v1/welcome-start', headers := jsonb_build_object('Content-Type','application/json','x-cron-secret',(select value from public.automation_config where key='cron_fire_secret')), body := '{\"source\":\"connect-install\"}'::jsonb) as request_id"
+          BODY=$(python3 -c 'import json,sys; print(json.dumps({"query": sys.argv[1]}))' "$SQL")
+          CODE=$(curl -sS -o /tmp/welcome.json -w "%{http_code}" -X POST "https://api.supabase.com/v1/projects/$REF/database/query" \
+            -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" -H "Content-Type: application/json" -d "$BODY")
+          if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
+            echo "welcome email queued (the worker writes the script and renders the video next)"
+            echo "Welcome email and video queued. They arrive after the next worker run (a few minutes)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::could not queue the welcome email (HTTP $CODE). Use Settings > Welcome email > Send again in the app."
+          fi
