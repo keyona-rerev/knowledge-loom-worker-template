@@ -425,6 +425,60 @@ jobs:
           # bwrap renderer, and stitches MP4/GIF with ffmpeg. The complete job and
           # the server re-check media signatures and size bounds.
           python3 scripts/render-welcome.py output.json input_snapshot.json "$RUNNER_TEMP/welcome"
+      - name: Self-contain visual-preview HTML (2026-11-19 font fix)
+        id: previewrewrite
+        if: always() && steps.window.outcome == 'success' && needs.verify-claim.outputs.mode == 'default' && steps.capture.outcome == 'success'
+        continue-on-error: true   # rewrite failure is model failure evidence; seal carries model_ok=false + fail_stage=preview-rewrite
+        run: |
+          # Preview html reached the app's sandboxed iframe exactly as the
+          # model wrote it - font-family names with no guaranteed fetchable
+          # source, so previews fell back to a system font while real renders
+          # (which inline fonts) were correct. Apply the SAME reviewed
+          # rewrite the PNG renderer uses (render/rewrite.py: bundled fonts
+          # as data URIs, bundled logo, enforced CSP as first head child,
+          # fail-closed on residual external refs) so the iframe receives a
+          # self-contained document that renders like the final PNG.
+          # Gate on the TRUSTED digest-verified claim snapshot, never model
+          # bytes. The model's contract {text: JSON{visual_type, html}} is
+          # unchanged; output.json is replaced only after every check passes.
+          # A failure is a named stage via the seal, never a degraded preview.
+          python3 - <<'PY'
+          import json
+          snap = json.load(open("input_snapshot.json"))
+          ok = isinstance(snap, dict) and snap.get("interactiveKind") == "visual-preview"
+          open(".preview-gate", "w").write("1" if ok else "0")
+          PY
+          if [ "$(cat .preview-gate)" != "1" ]; then echo "not a visual-preview job; nothing to rewrite"; exit 0; fi
+          rm -f .preview-gate
+          # Asset manifest - the same integrity check the renderer enforces.
+          ( cd render/assets && sha256sum -c ../assets.sha256 >/dev/null )
+          python3 - output.json /tmp/preview.html <<'PY'
+          import json, sys
+          o = json.load(open(sys.argv[1]))
+          if not isinstance(o, dict) or not isinstance(o.get("text"), str):
+              sys.exit('preview output.json is not {"text": ...}')
+          try:
+              inner = json.loads(o["text"])
+          except Exception:
+              sys.exit("preview output text is not parseable JSON")
+          if not isinstance(inner, dict) or set(inner.keys()) != {"visual_type", "html"}:
+              sys.exit("visual-preview output keys must be exactly visual_type + html")
+          if not isinstance(inner["html"], str) or len(inner["html"]) < 20:
+              sys.exit("preview html missing or implausibly small")
+          open(sys.argv[2], "w").write(inner["html"])
+          PY
+          python3 render/rewrite.py /tmp/preview.html
+          python3 - output.json /tmp/preview.html <<'PY'
+          import json, os, sys
+          o = json.load(open(sys.argv[1]))
+          inner = json.loads(o["text"])
+          inner["html"] = open(sys.argv[2]).read()
+          tmp = sys.argv[1] + ".new"
+          with open(tmp, "w") as f:
+              json.dump({"text": json.dumps(inner, separators=(",", ":"))}, f, separators=(",", ":"))
+          os.replace(tmp, sys.argv[1])
+          print("preview rewrite: ok (fonts/logo/CSP inlined, html bytes=%d)" % len(inner["html"]))
+          PY
       - name: Seal model artifacts (PUBLIC-KEY hybrid - no private material here)
         if: always() && steps.window.outcome == 'success'
         env:
@@ -437,6 +491,7 @@ jobs:
           RENDER_OUTCOME: ${{ steps.render.outcome }}
           WELCOME_OUTCOME: ${{ steps.welcome.outcome }}
           RENDER_WELCOME_OUTCOME: ${{ steps.render_welcome.outcome }}
+          PREVIEW_REWRITE_OUTCOME: ${{ steps.previewrewrite.outcome }}
           CAPTURE_OUTCOME: ${{ steps.capture.outcome }}
         run: |
           # Unchanged from v6: credentialless egress, RSA-OAEP(4096)+AES-GCM,
@@ -460,7 +515,7 @@ jobs:
             : MODE === "welcome"
             ? (process.env.WELCOME_OUTCOME === "success" && process.env.RENDER_WELCOME_OUTCOME === "success")
             : MODE === "discover" ? process.env.DISCOVER_OUTCOME === "success"
-            : process.env.DRAFT_OUTCOME === "success";
+            : (process.env.DRAFT_OUTCOME === "success" && process.env.PREVIEW_REWRITE_OUTCOME !== "failure");
           // Which stage failed, from step outcomes only (never from model text).
           // The complete job uses it so a post-model failure (capture/render) is
           // reported as that stage, not guessed from transcript keywords.
@@ -471,6 +526,7 @@ jobs:
             : process.env.CAPTURE_OUTCOME !== "success" ? "capture"
             : (MODE === "visual" && process.env.RENDER_OUTCOME !== "success") ? "render"
             : (MODE === "welcome" && process.env.RENDER_WELCOME_OUTCOME !== "success") ? "render" : null;
+            : (MODE === "default" && process.env.PREVIEW_REWRITE_OUTCOME === "failure") ? "preview-rewrite" : null;
           const pngB64 = MODE === "visual" ? rd(`${process.env.RUNNER_TEMP}/visual.png.b64`) : null;
           const mp4B64 = MODE === "welcome" ? rd(`${process.env.RUNNER_TEMP}/welcome/welcome.mp4.b64`) : null;
           const gifB64 = MODE === "welcome" ? rd(`${process.env.RUNNER_TEMP}/welcome/welcome.gif.b64`) : null;
@@ -640,6 +696,9 @@ jobs:
           elif model_failed and fail_stage == "capture":
               endpoint, out_payload = fail("error",
                   "model output capture refused: output.json missing or not a plain regular file (not an auth or quota failure)")
+          elif model_failed and fail_stage == "preview-rewrite":
+              endpoint, out_payload = fail("error",
+                  "visual-preview self-containment rewrite refused the generated HTML (asset manifest or rewrite failure; not an auth or quota failure)")
           elif model_failed:
               endpoint, out_payload = fail(classification,
                   tail or f"model step failed (job result {os.environ['MODEL_RESULT']}; step outcome not success)")
