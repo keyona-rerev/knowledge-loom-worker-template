@@ -698,7 +698,8 @@ jobs:
               if msgs is None: return "no transcript to audit"
               for m in msgs:
                   if not isinstance(m, dict): continue
-                  content = (m.get("message") or {}).get("content")
+                  mm = m.get("message")
+                  content = (mm if isinstance(mm, dict) else {}).get("content")
                   for x in content if isinstance(content, list) else []:
                       if not isinstance(x, dict) or x.get("type") != "tool_use": continue
                       name = x.get("name")
@@ -718,162 +719,168 @@ jobs:
                           return "unexpected Bash tool_use in transcript"
               return None
 
-          if expired:
-              endpoint, out_payload = fail("error", "claim window expired before completion (W4)")
-          elif model_failed and not unsealed:
-              endpoint, out_payload = fail("error",
-                  f"model job ended '{os.environ['MODEL_RESULT']}' with no sealed artifacts (pre-seal failure, e.g. claim window)")
-          elif unseal_err:
-              endpoint, out_payload = fail("error", f"model artifact unseal failed: {unseal_err}")
-          elif model_failed and fail_stage == "render" and os.environ["MODE"] == "welcome":
-              endpoint, out_payload = fail("error",
-                  "welcome render rejected: the word contract failed validation or the slide render/ffmpeg encode failed (exit-code stage failure; not an auth or quota failure)")
-          elif model_failed and fail_stage == "render":
-              endpoint, out_payload = fail("error",
-                  "visual render rejected: the sandboxed renderer refused the generated HTML before producing a PNG (exit-code stage failure; not an auth or quota failure)")
-          elif model_failed and fail_stage == "capture":
-              endpoint, out_payload = fail("error",
-                  "model output capture refused: output.json missing or not a plain regular file (not an auth or quota failure)")
-          elif model_failed and fail_stage == "preview-rewrite":
-              endpoint, out_payload = fail("error",
-                  "visual-preview self-containment rewrite refused the generated HTML (asset manifest or rewrite failure; not an auth or quota failure)")
-          elif model_failed:
-              endpoint, out_payload = fail(classification,
-                  tail or f"model step failed (job result {os.environ['MODEL_RESULT']}; step outcome not success)")
-          elif msgs is None:
-              endpoint, out_payload = fail("error", "successful model job without a parseable transcript (W2 fail-closed)")
-          elif audit():
-              endpoint, out_payload = fail("error", f"transcript write-audit failed: {audit()}")
-          else:
-              try:
-                  output = json.loads(unsealed.get("output") or "")
-              except Exception as e:
-                  endpoint, out_payload = fail("error", f"output.json unusable after successful model job: {type(e).__name__}")
+          try:
+              if expired:
+                  endpoint, out_payload = fail("error", "claim window expired before completion (W4)")
+              elif model_failed and not unsealed:
+                  endpoint, out_payload = fail("error",
+                      f"model job ended '{os.environ['MODEL_RESULT']}' with no sealed artifacts (pre-seal failure, e.g. claim window)")
+              elif unseal_err:
+                  endpoint, out_payload = fail("error", f"model artifact unseal failed: {unseal_err}")
+              elif model_failed and fail_stage == "render" and os.environ["MODE"] == "welcome":
+                  endpoint, out_payload = fail("error",
+                      "welcome render rejected: the word contract failed validation or the slide render/ffmpeg encode failed (exit-code stage failure; not an auth or quota failure)")
+              elif model_failed and fail_stage == "render":
+                  endpoint, out_payload = fail("error",
+                      "visual render rejected: the sandboxed renderer refused the generated HTML before producing a PNG (exit-code stage failure; not an auth or quota failure)")
+              elif model_failed and fail_stage == "capture":
+                  endpoint, out_payload = fail("error",
+                      "model output capture refused: output.json missing or not a plain regular file (not an auth or quota failure)")
+              elif model_failed and fail_stage == "preview-rewrite":
+                  endpoint, out_payload = fail("error",
+                      "visual-preview self-containment rewrite refused the generated HTML (asset manifest or rewrite failure; not an auth or quota failure)")
+              elif model_failed:
+                  endpoint, out_payload = fail(classification,
+                      tail or f"model step failed (job result {os.environ['MODEL_RESULT']}; step outcome not success)")
+              elif msgs is None:
+                  endpoint, out_payload = fail("error", "successful model job without a parseable transcript (W2 fail-closed)")
+              elif audit():
+                  endpoint, out_payload = fail("error", f"transcript write-audit failed: {audit()}")
               else:
-                  if os.environ["MODE"] == "visual":
-                      # >>> EXTRACT-BLOCK: complete-visual >>>
-                      png_b64 = unsealed.get("png_b64")
-                      vsnap = json.load(open("artifacts/trusted-claim/input_snapshot.json"))
-                      vctx = vsnap.get("context") or {}
-                      vcanvas = vctx.get("canvas") or {}
-                      # Contract (G1, worker-prompt.md): output.json is
-                      # {"text": "<minified JSON>"} whose text parses to
-                      # exactly {visual_type, html} - the same shape the
-                      # render driver unwraps. One contract, all stages.
-                      inner = None
-                      if isinstance(output, dict) and set(output.keys()) == {"text"} and isinstance(output.get("text"), str):
-                          try:
-                              inner = json.loads(output["text"])
-                          except Exception:
-                              inner = None
-                      if not isinstance(png_b64, str) or len(png_b64) < 100:
-                          endpoint, out_payload = fail("error", "visual mode without a rendered PNG in the sealed bundle")
-                      elif not isinstance(inner, dict) or set(inner.keys()) != {"visual_type", "html"}:
-                          endpoint, out_payload = fail("error", "visual output contract violation: output.json must be {text: JSON{visual_type, html}}")
-                      elif scan(json.dumps(inner)) or scan(png_b64):
-                          endpoint, out_payload = fail("error", "visual payload failed credential hygiene scan")
-                      else:
-                          import base64 as _b64, struct as _struct
-                          try:
-                              raw = _b64.b64decode(png_b64, validate=True)
-                              if raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
-                                  raise ValueError("not a PNG")
-                              pw, ph = _struct.unpack(">II", raw[16:24])
-                              if pw != vcanvas.get("w") or ph != vcanvas.get("h"):
-                                  raise ValueError(f"dims {pw}x{ph} != claim canvas {vcanvas.get('w')}x{vcanvas.get('h')}")
-                          except Exception as e:
-                              endpoint, out_payload = fail("error", f"PNG header/IHDR validation failed: {e}")
+                  try:
+                      output = json.loads(unsealed.get("output") or "")
+                  except Exception as e:
+                      endpoint, out_payload = fail("error", f"output.json unusable after successful model job: {type(e).__name__}")
+                  else:
+                      if os.environ["MODE"] == "visual":
+                          # >>> EXTRACT-BLOCK: complete-visual >>>
+                          png_b64 = unsealed.get("png_b64")
+                          vsnap = json.load(open("artifacts/trusted-claim/input_snapshot.json"))
+                          vctx = vsnap.get("context") or {}
+                          vcanvas = vctx.get("canvas") or {}
+                          # Contract (G1, worker-prompt.md): output.json is
+                          # {"text": "<minified JSON>"} whose text parses to
+                          # exactly {visual_type, html} - the same shape the
+                          # render driver unwraps. One contract, all stages.
+                          inner = None
+                          if isinstance(output, dict) and set(output.keys()) == {"text"} and isinstance(output.get("text"), str):
+                              try:
+                                  inner = json.loads(output["text"])
+                              except Exception:
+                                  inner = None
+                          if not isinstance(png_b64, str) or len(png_b64) < 100:
+                              endpoint, out_payload = fail("error", "visual mode without a rendered PNG in the sealed bundle")
+                          elif not isinstance(inner, dict) or set(inner.keys()) != {"visual_type", "html"}:
+                              endpoint, out_payload = fail("error", "visual output contract violation: output.json must be {text: JSON{visual_type, html}}")
+                          elif scan(json.dumps(inner)) or scan(png_b64):
+                              endpoint, out_payload = fail("error", "visual payload failed credential hygiene scan")
+                          else:
+                              import base64 as _b64, struct as _struct
+                              try:
+                                  raw = _b64.b64decode(png_b64, validate=True)
+                                  if raw[:8] != b"\x89PNG\r\n\x1a\n" or raw[12:16] != b"IHDR":
+                                      raise ValueError("not a PNG")
+                                  pw, ph = _struct.unpack(">II", raw[16:24])
+                                  if pw != vcanvas.get("w") or ph != vcanvas.get("h"):
+                                      raise ValueError(f"dims {pw}x{ph} != claim canvas {vcanvas.get('w')}x{vcanvas.get('h')}")
+                              except Exception as e:
+                                  endpoint, out_payload = fail("error", f"PNG header/IHDR validation failed: {e}")
+                              else:
+                                  endpoint = "claude-job-complete"
+                                  out_payload = {**payload, "output": inner, "pngBase64": png_b64,
+                                                 "visual_id": vctx.get("visual_id"), "source_hash": vctx.get("source_hash"),
+                                                 "canvas": vcanvas, "run_url": os.environ["RUN_URL"]}
+                          # <<< EXTRACT-BLOCK: complete-visual <<<
+                      elif os.environ["MODE"] == "welcome":
+                          # >>> EXTRACT-BLOCK: complete-welcome >>>
+                          # Contract (worker-prompt.md "Welcome-video jobs"): output.json
+                          # is {"text": "<minified JSON>"} whose text parses to exactly
+                          # {subject, preheader, intro, expect, slides}. render-welcome.py
+                          # already enforced lengths; re-check shape + media here.
+                          import base64 as _b64
+                          mp4_b64, gif_b64 = unsealed.get("mp4_b64"), unsealed.get("gif_b64")
+                          inner = None
+                          if isinstance(output, dict) and set(output.keys()) == {"text"} and isinstance(output.get("text"), str):
+                              try:
+                                  inner = json.loads(output["text"])
+                              except Exception:
+                                  inner = None
+                          WKEYS = {"subject", "preheader", "intro", "expect", "slides"}
+                          if not isinstance(mp4_b64, str) or len(mp4_b64) < 1000 or not isinstance(gif_b64, str) or len(gif_b64) < 100:
+                              endpoint, out_payload = fail("error", "welcome mode without rendered MP4/GIF in the sealed bundle")
+                          elif not isinstance(inner, dict) or set(inner.keys()) != WKEYS:
+                              endpoint, out_payload = fail("error", "welcome output contract violation: output.json must be {text: JSON{subject, preheader, intro, expect, slides}}")
+                          elif scan(json.dumps(inner)) or scan(mp4_b64) or scan(gif_b64):
+                              endpoint, out_payload = fail("error", "welcome payload failed credential hygiene scan")
+                          else:
+                              try:
+                                  mraw = _b64.b64decode(mp4_b64, validate=True)
+                                  graw = _b64.b64decode(gif_b64, validate=True)
+                                  if mraw[4:8] != b"ftyp" or len(mraw) > 8 * 1024 * 1024:
+                                      raise ValueError("mp4 signature/size")
+                                  if graw[:6] not in (b"GIF89a", b"GIF87a") or len(graw) > 3 * 1024 * 1024:
+                                      raise ValueError("gif signature/size")
+                              except Exception as e:
+                                  endpoint, out_payload = fail("error", f"welcome media validation failed: {e}")
+                              else:
+                                  endpoint = "claude-job-complete"
+                                  out_payload = {**payload, "output": inner, "mp4Base64": mp4_b64, "gifBase64": gif_b64,
+                                                 "run_url": os.environ["RUN_URL"]}
+                          # <<< EXTRACT-BLOCK: complete-welcome <<<
+                      elif isinstance(output, dict):
+                          output.pop("verified_urls", None)
+                          if os.environ["MODE"] == "discover":
+                              # Robust provenance extraction: the previous logic
+                              # required exactly one tool_result per user message and
+                              # a specific tool_use_result.results nesting, so
+                              # parallel WebSearch calls or a transcript shape change
+                              # silently yielded verified_urls=[] and the server
+                              # failed closed. Collect URLs from ANY nesting shape.
+                              # Provenance is preserved: URLs are collected ONLY
+                              # from system-generated tool_result messages whose
+                              # tool_use_id belongs to a WebSearch tool_use - never
+                              # from model-authored text.
+                              ids, urls = set(), set()
+                              for m in msgs:
+                                  if not isinstance(m, dict): continue
+                                  mm = m.get("message")
+                                  c = (mm if isinstance(mm, dict) else {}).get("content")
+                                  blocks = [x for x in c if isinstance(x, dict)] if isinstance(c, list) else []
+                                  for x in blocks:
+                                      if x.get("type") == "tool_use" and x.get("name") == "WebSearch": ids.add(x.get("id"))
+                              def _walk_urls(o):
+                                  if isinstance(o, dict):
+                                      u = o.get("url")
+                                      if isinstance(u, str) and u.startswith(("http://", "https://")): urls.add(u)
+                                      for v in o.values(): _walk_urls(v)
+                                  elif isinstance(o, list):
+                                      for v in o: _walk_urls(v)
+                              for m in msgs:
+                                  if not isinstance(m, dict) or m.get("type") != "user": continue
+                                  mm = m.get("message")
+                                  c = (mm if isinstance(mm, dict) else {}).get("content")
+                                  blocks = [x for x in c if isinstance(x, dict)] if isinstance(c, list) else []
+                                  hits = [x for x in blocks if x.get("type") == "tool_result" and not x.get("is_error") and x.get("tool_use_id") in ids]
+                                  if not hits: continue
+                                  for tr in hits: _walk_urls(tr)
+                                  _walk_urls(m.get("tool_use_result"))
+                              output["verified_urls"] = sorted(urls)[:500]
+                              print(f"discover provenance: {len(urls)} verified url(s) from WebSearch tool results")
+                      # The visual branch above is total (every path assigns its
+                      # own endpoint/out_payload); the generic tail is for
+                      # default/discover ONLY - never overwrite the visual/welcome result.
+                      if os.environ["MODE"] not in ("visual", "welcome"):
+                          blob = json.dumps(output)
+                          if scan(blob):
+                              endpoint, out_payload = fail("error", "output failed credential hygiene scan")
                           else:
                               endpoint = "claude-job-complete"
-                              out_payload = {**payload, "output": inner, "pngBase64": png_b64,
-                                             "visual_id": vctx.get("visual_id"), "source_hash": vctx.get("source_hash"),
-                                             "canvas": vcanvas, "run_url": os.environ["RUN_URL"]}
-                      # <<< EXTRACT-BLOCK: complete-visual <<<
-                  elif os.environ["MODE"] == "welcome":
-                      # >>> EXTRACT-BLOCK: complete-welcome >>>
-                      # Contract (worker-prompt.md "Welcome-video jobs"): output.json
-                      # is {"text": "<minified JSON>"} whose text parses to exactly
-                      # {subject, preheader, intro, expect, slides}. render-welcome.py
-                      # already enforced lengths; re-check shape + media here.
-                      import base64 as _b64
-                      mp4_b64, gif_b64 = unsealed.get("mp4_b64"), unsealed.get("gif_b64")
-                      inner = None
-                      if isinstance(output, dict) and set(output.keys()) == {"text"} and isinstance(output.get("text"), str):
-                          try:
-                              inner = json.loads(output["text"])
-                          except Exception:
-                              inner = None
-                      WKEYS = {"subject", "preheader", "intro", "expect", "slides"}
-                      if not isinstance(mp4_b64, str) or len(mp4_b64) < 1000 or not isinstance(gif_b64, str) or len(gif_b64) < 100:
-                          endpoint, out_payload = fail("error", "welcome mode without rendered MP4/GIF in the sealed bundle")
-                      elif not isinstance(inner, dict) or set(inner.keys()) != WKEYS:
-                          endpoint, out_payload = fail("error", "welcome output contract violation: output.json must be {text: JSON{subject, preheader, intro, expect, slides}}")
-                      elif scan(json.dumps(inner)) or scan(mp4_b64) or scan(gif_b64):
-                          endpoint, out_payload = fail("error", "welcome payload failed credential hygiene scan")
-                      else:
-                          try:
-                              mraw = _b64.b64decode(mp4_b64, validate=True)
-                              graw = _b64.b64decode(gif_b64, validate=True)
-                              if mraw[4:8] != b"ftyp" or len(mraw) > 8 * 1024 * 1024:
-                                  raise ValueError("mp4 signature/size")
-                              if graw[:6] not in (b"GIF89a", b"GIF87a") or len(graw) > 3 * 1024 * 1024:
-                                  raise ValueError("gif signature/size")
-                          except Exception as e:
-                              endpoint, out_payload = fail("error", f"welcome media validation failed: {e}")
-                          else:
-                              endpoint = "claude-job-complete"
-                              out_payload = {**payload, "output": inner, "mp4Base64": mp4_b64, "gifBase64": gif_b64,
-                                             "run_url": os.environ["RUN_URL"]}
-                      # <<< EXTRACT-BLOCK: complete-welcome <<<
-                  elif isinstance(output, dict):
-                      output.pop("verified_urls", None)
-                      if os.environ["MODE"] == "discover":
-                          # Robust provenance extraction: the previous logic
-                          # required exactly one tool_result per user message and
-                          # a specific tool_use_result.results nesting, so
-                          # parallel WebSearch calls or a transcript shape change
-                          # silently yielded verified_urls=[] and the server
-                          # failed closed. Collect URLs from ANY nesting shape.
-                          # Provenance is preserved: URLs are collected ONLY
-                          # from system-generated tool_result messages whose
-                          # tool_use_id belongs to a WebSearch tool_use - never
-                          # from model-authored text.
-                          ids, urls = set(), set()
-                          for m in msgs:
-                              if not isinstance(m, dict): continue
-                              mm = m.get("message")
-                              c = (mm if isinstance(mm, dict) else {}).get("content")
-                              blocks = [x for x in c if isinstance(x, dict)] if isinstance(c, list) else []
-                              for x in blocks:
-                                  if x.get("type") == "tool_use" and x.get("name") == "WebSearch": ids.add(x.get("id"))
-                          def _walk_urls(o):
-                              if isinstance(o, dict):
-                                  u = o.get("url")
-                                  if isinstance(u, str) and u.startswith(("http://", "https://")): urls.add(u)
-                                  for v in o.values(): _walk_urls(v)
-                              elif isinstance(o, list):
-                                  for v in o: _walk_urls(v)
-                          for m in msgs:
-                              if not isinstance(m, dict) or m.get("type") != "user": continue
-                              mm = m.get("message")
-                              c = (mm if isinstance(mm, dict) else {}).get("content")
-                              blocks = [x for x in c if isinstance(x, dict)] if isinstance(c, list) else []
-                              hits = [x for x in blocks if x.get("type") == "tool_result" and not x.get("is_error") and x.get("tool_use_id") in ids]
-                              if not hits: continue
-                              for tr in hits: _walk_urls(tr)
-                              _walk_urls(m.get("tool_use_result"))
-                          output["verified_urls"] = sorted(urls)[:500]
-                          print(f"discover provenance: {len(urls)} verified url(s) from WebSearch tool results")
-                  # The visual branch above is total (every path assigns its
-                  # own endpoint/out_payload); the generic tail is for
-                  # default/discover ONLY - never overwrite the visual/welcome result.
-                  if os.environ["MODE"] not in ("visual", "welcome"):
-                      blob = json.dumps(output)
-                      if scan(blob):
-                          endpoint, out_payload = fail("error", "output failed credential hygiene scan")
-                      else:
-                          endpoint = "claude-job-complete"
-                          out_payload = {**payload, "output": output, "run_url": os.environ["RUN_URL"]}
+                              out_payload = {**payload, "output": output, "run_url": os.environ["RUN_URL"]}
+          except Exception as e:
+              # fail-loud to the server, never strand the job: an unexpected
+              # builder exception is itself the outcome (run 45824904473).
+              endpoint, out_payload = fail("error",
+                  f"outcome builder exception: {type(e).__name__}")
           json.dump(out_payload, open("/tmp/payload.json", "w"))
           open("/tmp/endpoint", "w").write(endpoint)
           print(f"outcome: {endpoint}" + (f" reason={out_payload.get('reason_code')}" if endpoint == "claude-job-fail" else ""))
@@ -884,7 +891,7 @@ jobs:
           SUPABASE_FN_BASE: ${{ secrets.SUPABASE_FN_BASE }}
           WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
         run: |
-          test -s /tmp/payload.json && test -s /tmp/endpoint   # trusted-side invariant
+          test -s /tmp/payload.json && test -s /tmp/endpoint || { echo "::error::outcome files missing - builder died before writing payload/endpoint"; exit 1; }   # trusted-side invariant
           CODE=$(curl -s -o /tmp/resp.json -w "%{http_code}" -X POST "$SUPABASE_FN_BASE/$(cat /tmp/endpoint)"             -H "x-worker-secret: $WORKER_SECRET" -H "Content-Type: application/json"             -d @/tmp/payload.json)
           # job-logic.completeJob applies a novelty requeue and THEN returns 422
           # {success:false, requeued:true, reason} (deployed job-logic.ts:192-193).
@@ -900,3 +907,4 @@ jobs:
             echo "::error::$(cat /tmp/endpoint) POST returned HTTP $CODE: $(head -c 500 /tmp/resp.json)"
             exit 1
           fi
+
